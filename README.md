@@ -270,4 +270,4 @@ This tool uses lldb for all 3 keys — capturing them in a single parallel run w
 
 - Entitlement spoofing technique: [airdrop-keychain-extractor](https://github.com/seemoo-lab/airdrop-keychain-extractor) by TU Darmstadt (USENIX Security 2019), adapted for Find My by [FMIPDataManager-extractor](https://github.com/Pnut-GGG/FMIPDataManager-extractor)
 - Cache decryption: [findmy-cache-decryptor](https://github.com/Pnut-GGG/findmy-cache-decryptor)
-- LocalStorage.db cipher: reverse-engineered from `sqliteCodecCCCrypto` disassembly
+- 🤖 LocalStorage.db cipher: reverse-engineered from `sqliteCodecCCCrypto` disassembly by manonstreet & [Claude](https://claude.ai)
