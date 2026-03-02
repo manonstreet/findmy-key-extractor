@@ -260,7 +260,7 @@ Decrypted plaintext is typically a binary plist (`bplist00` header) containing d
 
 Under normal macOS security, all three keys are protected by Keychain ACLs restricting access to Apple-signed binaries with specific `keychain-access-group` entitlements. Extraction requires SIP/AMFI disabled in all cases (`findmylocateagent` is a `CS_PLATFORM_BINARY`).
 
-**FMIP/FMF keychain keys** can also be extracted by a custom app signed with spoofed entitlements — this is the approach pioneered by [FMIPDataManager-extractor](https://github.com/Pnut-GGG/FMIPDataManager-extractor), which informed this project's initial research. That approach works well for the 2 keychain-based keys.
+**FMIP/FMF keychain keys** can also be extracted by a custom app signed with spoofed entitlements — an approach pioneered by [airdrop-keychain-extractor](https://github.com/seemoo-lab/airdrop-keychain-extractor) (USENIX Security 2019) and adapted for Find My by [FMIPDataManager-extractor](https://github.com/Pnut-GGG/FMIPDataManager-extractor). That approach works well for the 2 keychain-based keys.
 
 **LocalStorage.key** is different. The key is in the keychain, but its ACL requires the `CS_PLATFORM_BINARY` flag — a kernel-level property of Apple-signed system binaries that cannot be spoofed, even with SIP/AMFI disabled and entitlement tricks. No third-party binary can query it. The only extraction path is lldb: attach to `findmylocateagent` as it passes the key in-memory to `sqlite3_key_v2(db, "main", key, 32)`, and read it from registers at the call site.
 
@@ -268,6 +268,6 @@ This tool uses lldb for all 3 keys — capturing them in a single parallel run w
 
 ## Credits
 
-- SIP/AMFI procedure: [FMIPDataManager-extractor](https://github.com/Pnut-GGG/FMIPDataManager-extractor) and [airdrop-keychain-extractor](https://github.com/seemoo-lab/airdrop-keychain-extractor)
+- Entitlement spoofing technique: [airdrop-keychain-extractor](https://github.com/seemoo-lab/airdrop-keychain-extractor) by TU Darmstadt (USENIX Security 2019), adapted for Find My by [FMIPDataManager-extractor](https://github.com/Pnut-GGG/FMIPDataManager-extractor)
 - Cache decryption: [findmy-cache-decryptor](https://github.com/Pnut-GGG/findmy-cache-decryptor)
 - LocalStorage.db cipher: reverse-engineered from `sqliteCodecCCCrypto` disassembly
