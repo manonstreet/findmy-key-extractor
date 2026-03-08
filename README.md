@@ -117,6 +117,7 @@ Reboot. Your Mac is back to its normal security posture. The extracted keys cont
 | `extract_db_key.py` | lldb breakpoint handler for `sqlite3_key_v2` |
 | `extract_keychain_keys.py` | lldb breakpoint handler for `SecItemCopyMatching` |
 | `verify_key.py` | Standalone key verifier — trial decryption |
+| `decrypt_localstorage.py` | Optional CLI decryptor for LocalStorage.db |
 | `requirements.txt` | Python dependencies |
 
 You can re-verify keys at any time (no SIP disable needed):
@@ -126,6 +127,19 @@ python3 verify_key.py keys/LocalStorage.key
 python3 verify_key.py keys/FMIPDataManager.bplist
 python3 verify_key.py keys/FMFDataManager.bplist
 ```
+
+### CLI Decryption
+
+**LocalStorage.db** — decrypt to a plain SQLite file you can open with any SQLite browser:
+
+```bash
+python3 decrypt_localstorage.py keys/LocalStorage.key
+# → LocalStorage_decrypted.sqlite
+```
+
+Applies WAL frames automatically if present. Use `-o` for a custom output path or `--db` to point to a non-default database location.
+
+**Cache files** (Devices.data, Items.data, FriendCacheData.data) — use [findmy-cache-decryptor](https://github.com/Pnut-GGG/findmy-cache-decryptor) with the FMIP/FMF keys.
 
 ---
 

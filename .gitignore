@@ -1,3 +1,4 @@
 keys/
 docs/
 .DS_Store
+*.sqlite*
