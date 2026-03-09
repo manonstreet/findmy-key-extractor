@@ -285,3 +285,7 @@ This tool uses lldb for all 3 keys — capturing them in a single parallel run w
 - Entitlement spoofing technique: [airdrop-keychain-extractor](https://github.com/seemoo-lab/airdrop-keychain-extractor) by Milan Stute et al. ([USENIX Security 2019](https://www.usenix.org/conference/usenixsecurity19/presentation/stute)), adapted for Find My by [FMIPDataManager-extractor](https://github.com/Pnut-GGG/FMIPDataManager-extractor)
 - Cache decryption: [findmy-cache-decryptor](https://github.com/Pnut-GGG/findmy-cache-decryptor)
 - 🤖 LocalStorage.db cipher: reverse-engineered from `sqliteCodecCCCrypto` disassembly by manonstreet & [Claude](https://claude.ai)
+
+## Disclaimer
+
+This tool accesses your own data on your own machine using your own credentials. It provides programmatic access to the same information already visible to you in the Find My app. It is intended for personal use, interoperability, and research. Use responsibly and in accordance with applicable laws.
