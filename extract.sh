@@ -36,9 +36,13 @@ echo "  ────────────────────────
 echo ""
 echo "  ⏳  Extracting keys (~10s)..."
 
-# ── Kill everything ───────────────────────────────────────────────────────
+# ── Pre-kill stale lldb instances and FindMy.app (NOT findmylocateagent yet —
+#    we need lldb to be in --wait-for state BEFORE we kill it, otherwise
+#    launchd respawns it before lldb starts waiting and --wait-for never fires.
+#    `pkill lldb` matches by exec name, so it kills the lldb children of any
+#    `sudo lldb` wrappers; their sudo parents exit when the child dies.) ────
+sudo pkill -9 lldb 2>/dev/null || true
 pkill -9 FindMy 2>/dev/null || true
-sudo pkill -9 findmylocateagent 2>/dev/null || true
 sleep 0.5
 
 # ── Prepare output directory ─────────────────────────────────────────────
@@ -46,8 +50,7 @@ mkdir -p "$KEYS_DIR"
 rm -f "$KEYS_DIR"/LocalStorage.key
 rm -f "$KEYS_DIR"/*.bplist
 
-# ── Launch both lldb sessions in parallel ─────────────────────────────────
-
+# ── Launch both lldb sessions in parallel — they enter --wait-for state ───
 sudo lldb --wait-for -n findmylocateagent \
     -o "settings set frame-format ''" \
     -o "settings set auto-confirm true" \
@@ -64,8 +67,17 @@ sudo lldb --wait-for -n FindMy \
     -o "quit" > "$LOG2" 2>&1 &
 PID2=$!
 
-# ── Open Find My after a brief delay (triggers both processes) ────────────
-sleep 2
+# ── Give the lldb waiters a moment to install themselves ──────────────────
+sleep 1
+
+# ── NOW restart findmylocateagent via launchctl — `pkill -9` is unreliable
+#    here (the daemon survives SIGKILL on some configurations, possibly due
+#    to launchd protection or a stuck-zombie state). `kickstart -k` cleanly
+#    stops and restarts via launchd's own mechanism so the waiting lldb
+#    catches the fresh PID. The agent runs in the per-user GUI domain. ────
+USER_UID=$(id -u "$(stat -f %Su /dev/console)")
+sudo launchctl kickstart -k "gui/$USER_UID/com.apple.findmy.findmylocateagent" 2>/dev/null || true
+sleep 1
 open /System/Applications/FindMy.app
 
 # ── Wait for both lldb sessions to finish ─────────────────────────────────
