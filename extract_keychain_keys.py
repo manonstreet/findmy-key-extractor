@@ -35,6 +35,64 @@ def _log(msg):
     print(msg, flush=True)
 
 
+def _is_x86(frame):
+    triple = frame.GetThread().GetProcess().GetTarget().GetTriple() or ""
+    return triple.startswith("x86_64")
+
+
+def _arg(frame, n):
+    """n-th integer/pointer arg under the platform C ABI (System V AMD64 / AAPCS64)."""
+    names = (["rdi", "rsi", "rdx", "rcx", "r8", "r9"] if _is_x86(frame)
+             else ["x0", "x1", "x2", "x3", "x4", "x5"])
+    return frame.FindRegister(names[n]).GetValueAsUnsigned()
+
+
+def _retval_signed(frame):
+    """Integer return value, signed (for OSStatus etc)."""
+    name = "rax" if _is_x86(frame) else "x0"
+    return frame.FindRegister(name).GetValueAsSigned()
+
+
+def _entry_return_address(frame):
+    """At a function-entry breakpoint, the address the function will return to.
+
+    On ARM64 this is the link register `lr`. On x86_64 the `call` instruction
+    just pushed the return address, so it's at `*(uint64_t*)$rsp`.
+    """
+    if _is_x86(frame):
+        process = frame.GetThread().GetProcess()
+        rsp = frame.FindRegister("rsp").GetValueAsUnsigned()
+        if not rsp:
+            return 0
+        err = lldb.SBError()
+        data = process.ReadMemory(int(rsp), 8, err)
+        if err.Fail() or not data:
+            return 0
+        return struct.unpack("<Q", bytes(data))[0]
+    return frame.FindRegister("lr").GetValueAsUnsigned()
+
+
+def _callee_saved_candidates(frame):
+    """Callee-saved registers that may still hold a value the function set up."""
+    if _is_x86(frame):
+        # rbp is also callee-saved but is typically the frame pointer; skip it.
+        return ["rbx", "r12", "r13", "r14", "r15"]
+    return ["x19", "x20", "x21"]
+
+
+# ARM64e adds Pointer Authentication Codes in the high bits of pointers; mask
+# to the low 40 bits to recover the real address. On x86_64 there is no PAC,
+# AND user-space pointers can use up to 47 bits (the 0x7fff_xxxx_xxxx range
+# for Catalyst apps), so masking would corrupt them. Use _strip_pac everywhere
+# we previously hardcoded `& 0x000000FFFFFFFFFF`.
+
+_PAC_MASK = 0x000000FFFFFFFFFF
+
+
+def _strip_pac(frame, ptr):
+    return ptr if _is_x86(frame) else (ptr & _PAC_MASK)
+
+
 def _read_mem(process, ptr, size):
     if not ptr or size <= 0 or size > 65536:
         return None
@@ -66,9 +124,10 @@ def _on_sqlite3_key_v2(frame, bp_loc, extra_args, internal_dict):
         return False
 
     process = frame.GetThread().GetProcess()
-    db_ptr  = frame.FindRegister("x0").GetValueAsUnsigned()
-    key_ptr = frame.FindRegister("x2").GetValueAsUnsigned()
-    key_len = frame.FindRegister("x3").GetValueAsUnsigned()
+    db_ptr  = _arg(frame, 0)
+    key_ptr = _arg(frame, 2)
+    key_len = _arg(frame, 3)
+    _log(f"  🔔  sqlite3_key_v2 hit: db=0x{db_ptr:x} key=0x{key_ptr:x} len={key_len}")
 
     if key_len != 32:
         return False
@@ -119,10 +178,10 @@ def _on_secitem_entry(frame, bp_loc, extra_args, internal_dict):
         return False
 
     try:
-        result_out_ptr = frame.FindRegister("x1").GetValueAsUnsigned()
-        lr_raw = frame.FindRegister("lr").GetValueAsUnsigned()
-        # Strip PAC bits (arm64e pointer authentication) — keep low 40 bits
-        lr = lr_raw & 0x000000FFFFFFFFFF
+        result_out_ptr = _arg(frame, 1)
+        lr_raw = _entry_return_address(frame)
+        _log(f"  🔔  SecItemCopyMatching hit: result_out=0x{result_out_ptr:x} retaddr=0x{lr_raw:x}")
+        lr = _strip_pac(frame, lr_raw)
 
         if not result_out_ptr or not lr:
             return False
@@ -167,13 +226,14 @@ def _handle_secitem_return(frame):
     global _secitem_captured, _secitem_resolved
 
     pc = frame.GetPC()
-    queue = _pending_returns.get(pc) or _pending_returns.get(pc & 0x000000FFFFFFFFFF)
+    pc_stripped = _strip_pac(frame, pc)
+    queue = _pending_returns.get(pc) or _pending_returns.get(pc_stripped)
     if not queue:
         return False
 
     ctx = queue.pop(0)  # FIFO — oldest call returns first
     # Clean up empty queues so the BP can be removed
-    addr = pc if pc in _pending_returns else (pc & 0x000000FFFFFFFFFF)
+    addr = pc if pc in _pending_returns else pc_stripped
     if addr in _pending_returns and not _pending_returns[addr]:
         del _pending_returns[addr]
 
@@ -182,8 +242,8 @@ def _handle_secitem_return(frame):
     idx = ctx["index"]
     result_out_ptr = ctx["result_out_ptr"]
 
-    # x0 = OSStatus (0 = success)
-    status = frame.FindRegister("x0").GetValueAsSigned()
+    # Return register (x0/rax) holds OSStatus; 0 = success
+    status = _retval_signed(frame)
     if status != 0:
         return False
 
@@ -193,8 +253,7 @@ def _handle_secitem_return(frame):
         return _try_secitem_objc_dump(frame, process, idx)
 
     data_ptr = struct.unpack('<Q', ptr_bytes)[0]
-    # Strip PAC bits from the data pointer too
-    data_ptr = data_ptr & 0x000000FFFFFFFFFF
+    data_ptr = _strip_pac(frame, data_ptr)
     if not data_ptr:
         return False
 
@@ -203,12 +262,13 @@ def _handle_secitem_return(frame):
 
 def _try_secitem_objc_dump(frame, process, idx):
     """Fallback: try to find the result via ObjC expression eval."""
-    # Try x19-x21 — callee-saved registers that might hold the result pointer
-    for reg_name in ["x19", "x20", "x21"]:
+    # Try callee-saved registers that might still hold the result pointer.
+    # ARM64 AAPCS: x19-x21. System V AMD64: rbx, r12-r15.
+    for reg_name in _callee_saved_candidates(frame):
         reg = frame.FindRegister(reg_name)
         if not reg.IsValid():
             continue
-        candidate = reg.GetValueAsUnsigned() & 0x000000FFFFFFFFFF
+        candidate = _strip_pac(frame, reg.GetValueAsUnsigned())
         if candidate < 0x100000000:  # skip small values (not heap pointers)
             continue
         # Probe if it looks like a CFData/NSData
@@ -260,7 +320,7 @@ def _save_secitem_result(frame, process, idx, result_ptr):
 
 def _read_nsstring(frame, process, ptr, opts):
     """Read an NSString value from an ObjC pointer."""
-    ptr = ptr & 0x000000FFFFFFFFFF
+    ptr = _strip_pac(frame, ptr)
     if not ptr:
         return None
     r_str = frame.EvaluateExpression(
@@ -283,7 +343,7 @@ def _save_dict_result(frame, process, idx, dict_ptr, opts):
         r_attr = frame.EvaluateExpression(
             f'(id)[(NSDictionary *){dict_ptr} objectForKey:@"{attr}"]', opts)
         if not r_attr.GetError().Fail():
-            attr_ptr = r_attr.GetValueAsUnsigned() & 0x000000FFFFFFFFFF
+            attr_ptr = _strip_pac(frame, r_attr.GetValueAsUnsigned())
             if attr_ptr:
                 attr_val = _read_nsstring(frame, process, attr_ptr, opts)
                 if attr_val:
@@ -294,7 +354,7 @@ def _save_dict_result(frame, process, idx, dict_ptr, opts):
     r_data = frame.EvaluateExpression(
         f'(id)[(NSDictionary *){dict_ptr} objectForKey:@"v_Data"]', opts)
     if not r_data.GetError().Fail():
-        v_data_ptr = r_data.GetValueAsUnsigned() & 0x000000FFFFFFFFFF
+        v_data_ptr = _strip_pac(frame, r_data.GetValueAsUnsigned())
         if v_data_ptr:
             # Use service name for filename if available
             name = service_name if service_name else f"secitem_{idx}"
@@ -317,7 +377,7 @@ def _serialize_and_save(frame, process, idx, obj_ptr, opts):
         r_desc = frame.EvaluateExpression(
             f'(id)[(id){obj_ptr} description]', opts)
         if not r_desc.GetError().Fail():
-            desc_ptr = r_desc.GetValueAsUnsigned() & 0x000000FFFFFFFFFF
+            desc_ptr = _strip_pac(frame, r_desc.GetValueAsUnsigned())
             if desc_ptr:
                 desc = _read_cstring(process, desc_ptr, 4096)
                 if desc:
@@ -329,7 +389,7 @@ def _serialize_and_save(frame, process, idx, obj_ptr, opts):
                     return False
         return False
 
-    ser_ptr = r_ser.GetValueAsUnsigned() & 0x000000FFFFFFFFFF
+    ser_ptr = _strip_pac(frame, r_ser.GetValueAsUnsigned())
     if not ser_ptr:
         return False
 
@@ -391,10 +451,13 @@ def __lldb_init_module(debugger, internal_dict):
         _log("  ❌  No valid target")
         return
 
+    triple = target.GetTriple() or "(unknown)"
+    _log(f"  📍  target triple: {triple}")
+
     _bp_key_v2 = target.BreakpointCreateByName("sqlite3_key_v2")
     _bp_key_v2.SetScriptCallbackFunction("extract_keychain_keys._on_sqlite3_key_v2")
 
     _bp_secitem = target.BreakpointCreateByName("SecItemCopyMatching")
     _bp_secitem.SetScriptCallbackFunction("extract_keychain_keys._on_secitem_entry")
 
-    _log("  ⏳  Waiting for key derivation...")
+    _log(f"  ⏳  Waiting for key derivation... (sqlite3_key_v2: {_bp_key_v2.GetNumLocations()} locs, SecItemCopyMatching: {_bp_secitem.GetNumLocations()} locs)")
