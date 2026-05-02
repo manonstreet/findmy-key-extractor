@@ -173,14 +173,14 @@ Both sessions run in the background. After Find My launches, both processes star
 sqlite3_key_v2(db, "main", key, 32)
 ```
 
-The lldb script reads AArch64 calling convention registers on the breakpoint:
+The lldb script detects the target architecture via `target.GetTriple()` and reads the appropriate calling convention registers:
 
-| Register | Value |
-|----------|-------|
-| `x0` | `sqlite3 *db` — database handle |
-| `x1` | `"main"` — schema name (always "main") |
-| `x2` | `const void *key` — pointer to 32-byte key |
-| `x3` | `32` — key length |
+| Argument | ARM64 (AAPCS64) | x86_64 (System V AMD64) | Value |
+|----------|-----------------|-------------------------|-------|
+| 0 | `x0` | `rdi` | `sqlite3 *db` — database handle |
+| 1 | `x1` | `rsi` | `"main"` — schema name (always "main") |
+| 2 | `x2` | `rdx` | `const void *key` — pointer to 32-byte key |
+| 3 | `x3` | `rcx` | `32` — key length |
 
 It then calls `sqlite3_db_filename(db, "main")` to identify which database this key belongs to. When the path contains `LocalStorage`, the 32-byte key is saved and the process is killed.
 
@@ -188,8 +188,8 @@ It then calls `sqlite3_db_filename(db, "main")` to identify which database this 
 
 `FindMy.app` reads keychain items via `SecItemCopyMatching(query, &result)`. The lldb script uses a two-phase approach:
 
-1. **Entry breakpoint**: Records the result pointer (`x1`) and return address (`lr` with PAC bits stripped via `& 0x000000FFFFFFFFFF`)
-2. **Return breakpoint**: One-shot breakpoint at the return address. Checks `x0 == 0` (success), then reads the result `NSDictionary`
+1. **Entry breakpoint**: Records the result pointer (arg 1: `x1` on ARM64, `rsi` on x86_64) and return address (`lr` on ARM64 with PAC bits stripped, `[rsp]` on x86_64)
+2. **Return breakpoint**: One-shot breakpoint at the return address. Checks return value == 0 (success via `x0` / `rax`), then reads the result `NSDictionary`
 
 From the dictionary, it extracts:
 - `svce` — service name (e.g., `"FMIPDataManager"`) → used as output filename
