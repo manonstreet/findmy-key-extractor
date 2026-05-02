@@ -27,6 +27,18 @@ def _log(msg):
     print(msg, flush=True)
 
 
+def _is_x86(frame):
+    triple = frame.GetThread().GetProcess().GetTarget().GetTriple() or ""
+    return triple.startswith("x86_64")
+
+
+def _arg(frame, n):
+    """n-th integer/pointer argument under the platform C ABI."""
+    names = (["rdi", "rsi", "rdx", "rcx", "r8", "r9"] if _is_x86(frame)
+             else ["x0", "x1", "x2", "x3", "x4", "x5"])
+    return frame.FindRegister(names[n]).GetValueAsUnsigned()
+
+
 def _read_mem(process, ptr, size):
     if not ptr or size <= 0 or size > 65536:
         return None
@@ -67,9 +79,10 @@ def on_sqlite3_key_v2(frame, bp_loc, extra_args, internal_dict):
         return False
 
     process = frame.GetThread().GetProcess()
-    db_ptr  = frame.FindRegister("x0").GetValueAsUnsigned()
-    key_ptr = frame.FindRegister("x2").GetValueAsUnsigned()
-    key_len = frame.FindRegister("x3").GetValueAsUnsigned()
+    db_ptr  = _arg(frame, 0)
+    key_ptr = _arg(frame, 2)
+    key_len = _arg(frame, 3)
+    _log(f"  🔔  sqlite3_key_v2 hit: db=0x{db_ptr:x} key=0x{key_ptr:x} len={key_len}")
 
     if key_len != 32:
         return False
@@ -100,6 +113,9 @@ def __lldb_init_module(debugger, internal_dict):
         _log("  ❌  No valid target")
         return
 
+    triple = target.GetTriple() or "(unknown)"
+    _log(f"  📍  target triple: {triple}")
+
     _bp = target.BreakpointCreateByName("sqlite3_key_v2")
     _bp.SetScriptCallbackFunction("extract_db_key.on_sqlite3_key_v2")
-    _log("  ⏳  Intercepting sqlite3_key_v2...")
+    _log(f"  ⏳  Intercepting sqlite3_key_v2 (resolved {_bp.GetNumLocations()} locations)")

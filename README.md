@@ -17,7 +17,7 @@ Used by [FindMySyncPlus](https://github.com/manonstreet/FindMySyncPlus) to decry
 
 ## Prerequisites
 
-- macOS (Apple Silicon only — Intel support is [planned](https://github.com/manonstreet/findmy-key-extractor/issues/2))
+- macOS (Apple Silicon **and** Intel x86_64; the lldb scripts dispatch on `target.GetTriple()`)
 - Xcode Command Line Tools — `xcode-select --install` (provides lldb)
 - Python 3 + pip
 - Find My app installed and signed into iCloud

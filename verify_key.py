@@ -17,6 +17,7 @@ Exit 0 on success, 1 on failure.
 
 import plistlib
 import struct
+import subprocess
 import sys
 from pathlib import Path
 
@@ -29,11 +30,38 @@ PAGE_SIZE    = 4096
 RESERVED_OFF = 4084
 SQLITE_MAGIC = b"SQLite format 3\x00"
 
-ENC_DB = (Path.home() /
-          "Library/Group Containers"
-          "/group.com.apple.findmy.findmylocateagent"
-          "/Library/Application Support"
-          "/LocalStorage.db")
+
+def _find_localstorage_db():
+    """Locate findmylocateagent's encrypted LocalStorage.db.
+
+    On recent macOS the agent stores its DB in DARWIN_USER_DIR (the per-user
+    confinement directory under /var/folders), not in the legacy
+    ~/Library/Group Containers location.
+    """
+    candidates = []
+    try:
+        darwin_user_dir = subprocess.run(
+            ["getconf", "DARWIN_USER_DIR"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        if darwin_user_dir:
+            candidates.append(
+                Path(darwin_user_dir)
+                / "com.apple.findmy.findmylocateagent" / "LocalStorage.db"
+            )
+    except Exception:
+        pass
+    candidates.append(
+        Path.home()
+        / "Library/Group Containers/group.com.apple.findmy.findmylocateagent"
+        / "Library/Application Support/LocalStorage.db"
+    )
+    for p in candidates:
+        if p.exists():
+            return p
+    return candidates[0]
+
+
+ENC_DB = _find_localstorage_db()
 
 
 def verify_localstorage_key(key_bytes, enc_db_path=ENC_DB):
