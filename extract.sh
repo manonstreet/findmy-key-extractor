@@ -85,6 +85,15 @@ if ! [ "${ARG_WAIT:-180}" -gt 0 ] 2>/dev/null; then
     echo "--wait needs a positive number of seconds" >&2; exit 2
 fi
 
+# How long to wait for Find My to read each keychain item. 45s was the original
+# budget and is too short on slow or virtualised hardware: the two items are read
+# at different moments, so a short wait can capture FMF and miss FMIP entirely —
+# observed on a 2014 Mac mini, reported independently from a Proxmox VM.
+# Assigned here, before anything prints it. FINDMY_WAIT_SECONDS still works.
+WAIT_SECONDS="${FINDMY_WAIT_SECONDS:-180}"
+[ -n "${ARG_WAIT:-}" ] && WAIT_SECONDS="$ARG_WAIT"
+ELAPSED=0
+
 if [ "$DO_SETUP" = "1" ]; then
     echo ""
     echo "  🔧  Setting up the verification dependencies"
@@ -191,13 +200,6 @@ sleep 1
 open /System/Applications/FindMy.app
 
 # ── Wait for keys (scripts kill targets when done) ────────────────────────
-# 45s was the original budget and is too short on slow or virtualised hardware:
-# Find My reads the two keychain items at different moments, so a short wait can
-# capture FMF and miss FMIP entirely — observed on a 2014 Mac mini, and reported
-# independently from a Proxmox VM. Override with FINDMY_WAIT_SECONDS if needed.
-WAIT_SECONDS="${FINDMY_WAIT_SECONDS:-180}"
-[ -n "${ARG_WAIT:-}" ] && WAIT_SECONDS="$ARG_WAIT"
-ELAPSED=0
 for _ in $(seq 1 "$WAIT_SECONDS"); do
     # Copy any FMF/FMIP bplists out of FindMy's sandbox container as soon
     # as they show up (extract_keychain_keys.py can't write $KEYS_DIR
