@@ -91,11 +91,20 @@ That is a regression in **lldb 1700** (Xcode 16): installing a second Python
 breakpoint callback from inside a running one crashes. Multiple people have hit
 it. Check your version with `lldb --version` and say so in your issue.
 
-### It times out before capturing anything
+### Some keys captured, others not — and the Debug section is empty
 
-The default wait is short for slow machines and VMs. Increase the loop limit in
-`extract.sh` — reporters running in Proxmox have needed roughly four times the
-default.
+An empty Debug block means nothing crashed; the run simply ended before Find My
+read every key. Find My reads the two keychain items at *different moments*, so a
+short wait can capture `FMFDataManager` and miss `FMIPDataManager` entirely.
+
+Wait longer:
+
+```bash
+FINDMY_WAIT_SECONDS=300 ./extract.sh
+```
+
+Slow or virtualised hardware routinely needs this — observed on a 2014 Mac mini
+and reported independently from a Proxmox VM.
 
 ### `pip install` tries to compile `cryptography` and fails
 

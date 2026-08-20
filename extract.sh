@@ -167,8 +167,13 @@ sudo launchctl kickstart -k "gui/$USER_UID/com.apple.findmy.findmylocateagent" 2
 sleep 1
 open /System/Applications/FindMy.app
 
-# ── Wait up to 45s for keys (scripts kill targets when done) ──────────────
-for _ in $(seq 1 45); do
+# ── Wait for keys (scripts kill targets when done) ────────────────────────
+# 45s was the original budget and is too short on slow or virtualised hardware:
+# Find My reads the two keychain items at different moments, so a short wait can
+# capture FMF and miss FMIP entirely — observed on a 2014 Mac mini, and reported
+# independently from a Proxmox VM. Override with FINDMY_WAIT_SECONDS if needed.
+WAIT_SECONDS="${FINDMY_WAIT_SECONDS:-180}"
+for _ in $(seq 1 "$WAIT_SECONDS"); do
     # Copy any FMF/FMIP bplists out of FindMy's sandbox container as soon
     # as they show up (extract_keychain_keys.py can't write $KEYS_DIR
     # directly from inside the sandboxed process).
@@ -268,8 +273,19 @@ if [ "$FAIL" -ne 0 ]; then
     KEEP_LOGS=1
     # The emoji lines are our own; the real cause is usually a Python traceback
     # or an lldb error, which matches none of them.
-    grep -hE '⚠️|❌|Traceback|Error|error:|KeyError|Exception|RuntimeError|failed' \
-        "$LOG1" "$LOG2" 2>/dev/null | grep -v "^  *$" | tail -30 || true
+    FOUND=$(grep -hE '⚠️|❌|Traceback|Error|error:|KeyError|Exception|RuntimeError|failed' \
+        "$LOG1" "$LOG2" 2>/dev/null | grep -v "^  *$" | tail -30 || true)
+    if [ -n "$FOUND" ]; then
+        printf '%s\n' "$FOUND"
+    else
+        # No error at all usually means we ran out of time rather than broke:
+        # Find My reads the keychain items at different moments, so a short wait
+        # captures some and misses others.
+        echo "  No errors in the lldb logs — the run most likely ended before"
+        echo "  Find My read every key. Waited ${WAIT_SECONDS}s."
+        echo ""
+        echo "  Try a longer wait:   FINDMY_WAIT_SECONDS=300 ./extract.sh"
+    fi
 fi
 
 if [ "$FAIL" -eq 0 ]; then
