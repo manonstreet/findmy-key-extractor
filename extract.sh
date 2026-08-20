@@ -152,7 +152,6 @@ echo "  🔑  Find My Key Extractor"
 echo "  ─────────────────────────"
 echo ""
 echo "  ⏳  Waiting for Find My to read its keys (up to ${WAIT_SECONDS}s)..."
-echo "      It reads them at different moments, so this is not usually quick."
 echo ""
 
 # ── Pre-kill stale lldb instances and FindMy.app (NOT findmylocateagent yet —
@@ -242,9 +241,19 @@ for _ in $(seq 1 "$WAIT_SECONDS"); do
 done
 
 [ -t 1 ] && printf '\r%*s\r' 60 ""
+
+# Drop the lldb sessions from the job table before killing them. Otherwise bash
+# announces the reap itself — "line N: 1234 Killed: 9  sudo lldb --wait-for …" —
+# which looks like an error to the user and is nothing of the kind. `wait` can't
+# be used on a disowned job, so poll for exit instead.
+disown "$PID1" "$PID2" 2>/dev/null || true
 sudo kill -9 "$PID1" "$PID2" 2>/dev/null || true
-wait "$PID1" 2>/dev/null || true
-wait "$PID2" 2>/dev/null || true
+for _ in $(seq 1 15); do
+    if ! kill -0 "$PID1" 2>/dev/null && ! kill -0 "$PID2" 2>/dev/null; then
+        break
+    fi
+    sleep 0.2
+done
 
 # One last copy pass in case a bplist landed in the sandbox tmp dir right
 # as the loop above exited.
