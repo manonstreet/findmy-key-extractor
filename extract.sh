@@ -230,7 +230,7 @@ for _ in $(seq 1 "$WAIT_SECONDS"); do
     fi
 
     if [ "$got" -ge 3 ]; then
-        [ -t 1 ] && printf '\r%*s\r' 60 ""
+        [ -t 1 ] && printf '\r\033[2K' 
         break
     fi
     # Also done if both lldb sessions exited
@@ -240,7 +240,7 @@ for _ in $(seq 1 "$WAIT_SECONDS"); do
     sleep 1
 done
 
-[ -t 1 ] && printf '\r%*s\r' 60 ""
+[ -t 1 ] && printf '\r\033[2K' 
 
 # Drop the lldb sessions from the job table before killing them. Otherwise bash
 # announces the reap itself — "line N: 1234 Killed: 9  sudo lldb --wait-for …" —
