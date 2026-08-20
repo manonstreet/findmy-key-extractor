@@ -2,3 +2,9 @@ keys/
 docs/
 .DS_Store
 *.sqlite*
+
+# Local virtualenv for the verification dependencies (README Step 2)
+.venv/
+
+# lldb logs kept from failed runs (may contain paths)
+logs/

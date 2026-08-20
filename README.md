@@ -59,9 +59,25 @@ nvram boot-args         # should show amfi_get_out_of_my_way=1
 
 ```bash
 cd findmy-key-extractor
-pip3 install -r requirements.txt   # one-time: pycryptodome + cryptography
+./extract.sh --setup   # one-time: virtualenv in .venv + pycryptodome, cryptography
 ./extract.sh
 ```
+
+`--setup` is opt-in rather than automatic: this script runs `sudo lldb` against
+system processes on a machine with SIP disabled, so it doesn't fetch anything
+from PyPI unless you ask it to. Nothing outside `.venv` is touched, and later
+runs pick that up without it being activated.
+
+Prefer to do it yourself:
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+A virtualenv rather than a plain `pip3 install` because it works whichever
+`python3` you have — Apple's permits a direct install, Homebrew's refuses it
+(`externally-managed-environment`).
 
 No interaction needed. The script launches two parallel lldb sessions, restarts the Find My processes to trigger key loading, captures the keys, and verifies each one:
 
@@ -101,6 +117,10 @@ Reboot. Your Mac is back to its normal security posture. The extracted keys cont
 
 ## Troubleshooting
 
+Longer answers to recurring questions — SIP on OpenCore/OCLP machines, AMFI boot
+arguments, partial key capture, where `LocalStorage.db` lives — are in [FAQ.md](FAQ.md).
+
+
 | Problem | Fix |
 |---------|-----|
 | `error: attach failed` | SIP/AMFI not fully disabled. Try `csrutil disable` (full) in Recovery. |
@@ -108,6 +128,8 @@ Reboot. Your Mac is back to its normal security posture. The extracted keys cont
 | `findmylocateagent` not found | Open Find My at least once — the agent only starts after first launch. |
 | Key verification fails | Find My cache may be stale. Open Find My, wait for it to refresh, re-run. |
 | `pip3: command not found` | Install Python 3: `brew install python3` or use `python3 -m pip`. |
+| `error: externally-managed-environment` | Your `python3` is PEP 668-managed (Homebrew's unversioned `python`, pyenv, …). Run `./extract.sh --setup` rather than `--break-system-packages`. |
+| `ModuleNotFoundError: No module named 'Crypto'` | Dependencies missing for the interpreter in use. Run `./extract.sh --setup`; the script also checks this before extracting. |
 
 ## Files
 
@@ -119,6 +141,9 @@ Reboot. Your Mac is back to its normal security posture. The extracted keys cont
 | `verify_key.py` | Standalone key verifier — trial decryption |
 | `decrypt_localstorage.py` | Optional CLI decryptor for LocalStorage.db |
 | `requirements.txt` | Python dependencies |
+
+The commands below call `python3` directly, unlike `extract.sh` — use
+`.venv/bin/python3` in place of `python3`, or activate the virtualenv first.
 
 You can re-verify keys at any time (no SIP disable needed):
 
