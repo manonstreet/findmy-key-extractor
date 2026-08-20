@@ -100,7 +100,7 @@ short wait can capture `FMFDataManager` and miss `FMIPDataManager` entirely.
 Wait longer:
 
 ```bash
-FINDMY_WAIT_SECONDS=300 ./extract.sh
+./extract.sh --wait 300
 ```
 
 Slow or virtualised hardware routinely needs this — observed on a 2014 Mac mini

@@ -60,7 +60,7 @@ nvram boot-args         # should show amfi_get_out_of_my_way=1
 ```bash
 cd findmy-key-extractor
 ./extract.sh --setup   # one-time: virtualenv in .venv + pycryptodome, cryptography
-./extract.sh
+./extract.sh           # add --wait 300 on slow or virtualised machines
 ```
 
 `--setup` is opt-in rather than automatic: this script runs `sudo lldb` against
