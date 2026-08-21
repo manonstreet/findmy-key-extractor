@@ -387,7 +387,7 @@ while [ "$ELAPSED" -lt "$BUDGET" ]; do
             # so the measurement was simply absent while looking deployed.
             # stdout is already captured per run and cannot go missing.
             [ -t 1 ] && printf '\r\033[2K'
-            echo "  ⏱  $_K captured at ${ELAPSED}s"
+            echo "  ⏱  [$(date +%H:%M:%S)] $_K captured at ${ELAPSED}s"
         fi
     done
 

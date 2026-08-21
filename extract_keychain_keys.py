@@ -13,6 +13,7 @@ Keys are written to disk only — never printed to terminal.
 """
 
 import lldb
+import time
 import struct
 from pathlib import Path
 
@@ -31,7 +32,12 @@ _done = False
 
 
 def _log(msg):
-    print(msg, flush=True)
+    # Wall clock on every line. Elapsed-from-run-start cannot separate capture
+    # cost from relaunch cycles: LocalStorage.key is captured by identical code
+    # on both variants and still differed by 2.6s between them, purely because
+    # one branch relaunched more before reaching it. A read-to-capture delta is
+    # the only honest measure, and it needs timestamps on both ends.
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
 def _is_x86(frame):
@@ -382,17 +388,43 @@ def _attempt_capture(frame, process, ctx):
     if data_ptr == ctx.get("query_ptr"):
         return f"ptr 0x{data_ptr:x} IS THE QUERY dictionary, not the result"
 
-    present = []
+    # Count errored sends separately from nil returns. Collapsing them is how
+    # "no recognisable keychain keys" ended up meaning either "a real dictionary
+    # with different contents" or "a pointer that cannot be messaged at all" —
+    # which point at opposite fixes.
+    present, nil_keys, errors = [], 0, 0
+    last_err = None
     for k in ("v_Data", "class", "svce", "acct", "agrp", "labl", "r_Data", "m_Limit"):
         try:
             r = frame.EvaluateExpression(
                 f'(id)[(NSDictionary *){data_ptr} objectForKey:@"{k}"]', opts_objc(frame))
-            if not r.GetError().Fail() and r.GetValueAsUnsigned():
+            if r.GetError().Fail():
+                errors += 1
+                last_err = r.GetError().GetCString() or "expression failed"
+            elif r.GetValueAsUnsigned():
                 present.append(k)
-        except Exception:
-            pass
-    shape = ", ".join(present) if present else "no recognisable keychain keys"
-    return f"ptr 0x{data_ptr:x} yielded no key; dict holds: {shape}"
+            else:
+                nil_keys += 1
+        except Exception as e:
+            errors += 1
+            last_err = str(e)
+
+    # A count message send is the cheapest liveness test: a real dictionary
+    # answers it, a bad pointer does not.
+    count = None
+    try:
+        rc = frame.EvaluateExpression(
+            f'(long)[(NSDictionary *){data_ptr} count]', opts_objc(frame))
+        if not rc.GetError().Fail():
+            count = rc.GetValueAsSigned()
+    except Exception:
+        pass
+
+    if errors:
+        return (f"ptr 0x{data_ptr:x} NOT MESSAGEABLE — {errors}/8 sends errored "
+                f"(count={count}) last: {last_err}")
+    return (f"ptr 0x{data_ptr:x} is a live dict, count={count}, "
+            f"{nil_keys}/8 known keys nil, present: {', '.join(present) or 'none'}")
 
 
 def opts_objc(frame):
