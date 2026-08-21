@@ -296,8 +296,46 @@ for _ in $(seq 1 "$WAIT_SECONDS"); do
         [ -t 1 ] && printf '\r\033[2K' 
         break
     fi
-    # Also done if both lldb sessions exited
-    if ! kill -0 "$PID1" 2>/dev/null && ! kill -0 "$PID2" 2>/dev/null; then
+    # Stop as soon as the outcome is known, rather than serving out the clock.
+    # Each lldb session owns specific keys — PID1 the LocalStorage key, PID2 the
+    # two keychain bplists — and a session exits once it has finished, whether or
+    # not it captured anything. So a dead session with its keys still missing is
+    # a settled failure, and waiting past it just hides which half went wrong
+    # behind a timeout message that blames slow hardware.
+    # One more copy attempt first: a session can exit in the window between this
+    # iteration's copy pass and the check below, and a bplist sitting in the
+    # sandbox uncopied must not be read as a failed capture.
+    for NAME in FMFDataManager FMIPDataManager; do
+        if [ -f "$FINDMY_TMP_DIR/$NAME.bplist" ] && [ ! -f "$KEYS_DIR/$NAME.bplist" ]; then
+            chmod u+r "$FINDMY_TMP_DIR/$NAME.bplist" 2>/dev/null || true
+            cp "$FINDMY_TMP_DIR/$NAME.bplist" "$KEYS_DIR/$NAME.bplist" 2>/dev/null || true
+        fi
+    done
+
+    LS_PENDING=0; KC_PENDING=0
+    [ ! -f "$KEYS_DIR/LocalStorage.key" ] && [ ! -f "$KEYS_DIR/LocalStorage.key.candidate" ] && LS_PENDING=1
+    { [ ! -f "$KEYS_DIR/FMFDataManager.bplist" ] || [ ! -f "$KEYS_DIR/FMIPDataManager.bplist" ]; } && KC_PENDING=1
+
+    P1_DEAD=0; kill -0 "$PID1" 2>/dev/null || P1_DEAD=1
+    P2_DEAD=0; kill -0 "$PID2" 2>/dev/null || P2_DEAD=1
+
+    if [ "$P1_DEAD" = "1" ] && [ "$LS_PENDING" = "1" ] && [ -z "${SAID_LS:-}" ]; then
+        SAID_LS=1
+        [ -t 1 ] && printf '\r\033[2K'
+        echo "  ⚠️  the findmylocateagent session ended after ${ELAPSED}s without"
+        echo "      capturing LocalStorage.key — see ./logs/lldb_locateagent.log"
+    fi
+    if [ "$P2_DEAD" = "1" ] && [ "$KC_PENDING" = "1" ] && [ -z "${SAID_KC:-}" ]; then
+        SAID_KC=1
+        [ -t 1 ] && printf '\r\033[2K'
+        echo "  ⚠️  the FindMy session ended after ${ELAPSED}s without capturing"
+        echo "      both keychain keys — see ./logs/lldb_findmy.log"
+    fi
+
+    # Nothing left that could still arrive.
+    if { [ "$P1_DEAD" = "1" ] || [ "$LS_PENDING" = "0" ]; } &&
+       { [ "$P2_DEAD" = "1" ] || [ "$KC_PENDING" = "0" ]; }; then
+        [ -t 1 ] && printf '\r\033[2K'
         break
     fi
     sleep 1
