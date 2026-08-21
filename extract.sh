@@ -93,6 +93,8 @@ fi
 WAIT_SECONDS="${FINDMY_WAIT_SECONDS:-180}"
 [ -n "${ARG_WAIT:-}" ] && WAIT_SECONDS="$ARG_WAIT"
 ELAPSED=0
+# How many times to reattach if the locateagent session dies without the key.
+LOCATE_RETRIES=2
 
 if [ "$DO_SETUP" = "1" ]; then
     echo ""
@@ -229,16 +231,28 @@ fi
 # the single mechanism behind every capture loss seen so far: batch-mode lldb
 # quits the instant it sees a stop with nothing left to run. Extras are harmless
 # once the target is gone; extract.sh kills these sessions itself regardless.
-sudo lldb --wait-for -n findmylocateagent \
-    -o "settings set frame-format ''" \
-    -o "settings set auto-confirm true" \
-    -o "command script import $SCRIPT_DIR/extract_db_key.py" \
-    -o "process continue" \
-    -o "process continue" \
-    -o "process continue" \
-    -o "process continue" \
-    -o "process continue" > "$LOG1" 2>&1 &
-PID1=$!
+# The locateagent session is armed through a function because it may need to be
+# armed more than once. `lldb --wait-for` attaches to the next process with this
+# name that launches — which is not necessarily the one we are about to start.
+# The agent is launchd-managed with KeepAlive, so it can respawn on its own in
+# the window between arming lldb and running kickstart; lldb then attaches to
+# that instance, `kickstart -k` terminates it, and the session is left holding a
+# corpse with its breakpoint never resolved. Seen once in twenty runs: the log
+# shows `resolved 0 locations`, then SIGTERM during dyld, and no key.
+arm_locateagent() {
+    sudo lldb --wait-for -n findmylocateagent \
+        -o "settings set frame-format ''" \
+        -o "settings set auto-confirm true" \
+        -o "command script import $SCRIPT_DIR/extract_db_key.py" \
+        -o "process continue" \
+        -o "process continue" \
+        -o "process continue" \
+        -o "process continue" \
+        -o "process continue" >> "$LOG1" 2>&1 &
+    PID1=$!
+}
+: > "$LOG1"
+arm_locateagent
 
 sudo lldb --wait-for -n FindMy \
     -o "settings set frame-format ''" \
@@ -260,7 +274,10 @@ sleep 1
 #    stops and restarts via launchd's own mechanism so the waiting lldb
 #    catches the fresh PID. The agent runs in the per-user GUI domain. ────
 USER_UID=$(id -u "$(stat -f %Su /dev/console)")
-sudo launchctl kickstart -k "gui/$USER_UID/com.apple.findmy.findmylocateagent" 2>/dev/null || true
+kick_locateagent() {
+    sudo launchctl kickstart -k "gui/$USER_UID/com.apple.findmy.findmylocateagent" 2>/dev/null || true
+}
+kick_locateagent
 sleep 1
 open /System/Applications/FindMy.app
 
@@ -334,11 +351,27 @@ for _ in $(seq 1 "$WAIT_SECONDS"); do
     P1_DEAD=0; kill -0 "$PID1" 2>/dev/null || P1_DEAD=1
     P2_DEAD=0; kill -0 "$PID2" 2>/dev/null || P2_DEAD=1
 
-    if [ "$P1_DEAD" = "1" ] && [ "$LS_PENDING" = "1" ] && [ -z "${SAID_LS:-}" ]; then
-        SAID_LS=1
-        [ -t 1 ] && printf '\r\033[2K'
-        echo "  ⚠️  the findmylocateagent session ended after ${ELAPSED}s without"
-        echo "      capturing LocalStorage.key — see ./logs/lldb_locateagent.log"
+    if [ "$P1_DEAD" = "1" ] && [ "$LS_PENDING" = "1" ]; then
+        # A dead session with no key is usually the wrong-instance attach above,
+        # which a second attempt clears — the agent is still there to be
+        # restarted. Retry rather than spend the rest of the window on a session
+        # that is already gone. Bounded, and it logs every attempt.
+        if [ "${LOCATE_RETRIES:-0}" -gt 0 ]; then
+            LOCATE_RETRIES=$((LOCATE_RETRIES - 1))
+            [ -t 1 ] && printf '\r\033[2K'
+            echo "  ↻  the findmylocateagent session ended without the key after"
+            echo "      ${ELAPSED}s — reattaching and restarting the agent"
+            echo "" >> "$LOG1"
+            echo "──── retry ────" >> "$LOG1"
+            arm_locateagent
+            sleep 1
+            kick_locateagent
+        elif [ -z "${SAID_LS:-}" ]; then
+            SAID_LS=1
+            [ -t 1 ] && printf '\r\033[2K'
+            echo "  ⚠️  the findmylocateagent session ended after ${ELAPSED}s without"
+            echo "      capturing LocalStorage.key — see ./logs/lldb_locateagent.log"
+        fi
     fi
     if [ "$P2_DEAD" = "1" ] && [ "$KC_PENDING" = "1" ] && [ -z "${SAID_KC:-}" ]; then
         SAID_KC=1
