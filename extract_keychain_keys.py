@@ -202,6 +202,12 @@ def _on_secitem_entry(frame, bp_loc, extra_args, internal_dict):
             "result_out_ptr": result_out_ptr,
             "index": idx,
             "service": service,
+            # The query dictionary this call passed in. If the pointer we later
+            # read out of the result slot equals this, we are looking at the
+            # query rather than the result — which is the difference between a
+            # timing problem and a matching problem, and nothing else we have
+            # logged can tell those apart.
+            "query_ptr": _strip_pac(frame, query_ptr),
             "sp": sp,
         })
     except Exception as e:
@@ -366,7 +372,35 @@ def _attempt_capture(frame, process, ctx):
 
     before = _secitem_captured
     _save_secitem_result(frame, process, idx, data_ptr)
-    return None if _secitem_captured > before else f"ptr 0x{data_ptr:x} yielded no key"
+    if _secitem_captured > before:
+        return None
+
+    # Identify what we were handed. Probing individual keys is far more robust
+    # than reading a description string — each is a plain non-null pointer test,
+    # where the previous attempt (allKeys -> description -> UTF8String ->
+    # read_cstring) had four ways to come back empty, and did.
+    if data_ptr == ctx.get("query_ptr"):
+        return f"ptr 0x{data_ptr:x} IS THE QUERY dictionary, not the result"
+
+    present = []
+    for k in ("v_Data", "class", "svce", "acct", "agrp", "labl", "r_Data", "m_Limit"):
+        try:
+            r = frame.EvaluateExpression(
+                f'(id)[(NSDictionary *){data_ptr} objectForKey:@"{k}"]', opts_objc(frame))
+            if not r.GetError().Fail() and r.GetValueAsUnsigned():
+                present.append(k)
+        except Exception:
+            pass
+    shape = ", ".join(present) if present else "no recognisable keychain keys"
+    return f"ptr 0x{data_ptr:x} yielded no key; dict holds: {shape}"
+
+
+def opts_objc(frame):
+    o = lldb.SBExpressionOptions()
+    o.SetTimeoutInMicroSeconds(2_000_000)
+    o.SetTryAllThreads(False)
+    o.SetLanguage(lldb.eLanguageTypeObjC)
+    return o
 
 
 def _try_secitem_objc_dump(frame, process, idx):

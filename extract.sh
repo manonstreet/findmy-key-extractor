@@ -382,7 +382,12 @@ while [ "$ELAPSED" -lt "$BUDGET" ]; do
     for _K in LocalStorage.key FMFDataManager.bplist FMIPDataManager.bplist; do
         if [ -f "$KEYS_DIR/$_K" ] && ! echo "${TIMED:-}" | grep -q "$_K"; then
             TIMED="${TIMED:-} $_K"
-            echo "  ⏱  $_K captured at ${ELAPSED}s" >> "$TIMING_LOG"
+            # To stdout, not a side file. The side file never appeared on
+            # either branch across 50 runs and produced no error to explain it,
+            # so the measurement was simply absent while looking deployed.
+            # stdout is already captured per run and cannot go missing.
+            [ -t 1 ] && printf '\r\033[2K'
+            echo "  ⏱  $_K captured at ${ELAPSED}s"
         fi
     done
 
