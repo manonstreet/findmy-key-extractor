@@ -540,7 +540,14 @@ def _serialize_and_save(frame, process, idx, obj_ptr, opts):
 
 
 def _save_cfdata(frame, process, idx, data_ptr, opts=None, name=None):
-    """Read a CFData/NSData and save to disk."""
+    """Read a CFData/NSData and save to disk.
+
+    Every exit here used to be a bare `return False`, which is how a v_Data
+    pointer that was found and non-null still produced "yielded no key" five
+    times with nothing to say for itself. Four distinct failures live in this
+    function and they need different fixes: an object that is not really a
+    CFData, a zero length, an unreadable byte pointer, and a failed memory read.
+    """
     global _secitem_captured
 
     if opts is None:
@@ -555,10 +562,13 @@ def _save_cfdata(frame, process, idx, data_ptr, opts=None, name=None):
         r_len = frame.EvaluateExpression(
             f'(unsigned long)[(NSData *){data_ptr} length]', opts)
         if r_len.GetError().Fail():
+            _log(f"     ↳ cfdata 0x{data_ptr:x}: length unavailable "
+                 f"({r_len.GetError().GetCString() or 'expression failed'})")
             return False
 
     length = r_len.GetValueAsUnsigned()
     if length == 0 or length > 1_000_000:
+        _log(f"     ↳ cfdata 0x{data_ptr:x}: length {length} out of range")
         return False
 
     r_bytes = frame.EvaluateExpression(
@@ -568,11 +578,15 @@ def _save_cfdata(frame, process, idx, data_ptr, opts=None, name=None):
         r_bytes = frame.EvaluateExpression(
             f'(void *)[(NSData *){data_ptr} bytes]', opts)
         if r_bytes.GetError().Fail():
+            _log(f"     ↳ cfdata 0x{data_ptr:x}: byte pointer unavailable "
+                 f"({r_bytes.GetError().GetCString() or 'expression failed'}), len={length}")
             return False
 
     bytes_ptr = r_bytes.GetValueAsUnsigned()
     data = _read_mem(process, bytes_ptr, length)
     if not data:
+        _log(f"     ↳ cfdata 0x{data_ptr:x}: read of {length}B at "
+             f"0x{bytes_ptr:x} returned nothing")
         return False
 
     filename = f"{name}.bplist" if name else f"secitem_{idx}.bplist"
