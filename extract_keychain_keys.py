@@ -488,6 +488,21 @@ def _save_dict_result(frame, process, idx, dict_ptr, opts):
             name = service_name if service_name else f"secitem_{idx}"
             return _save_cfdata(frame, process, idx, v_data_ptr, opts, name)
 
+    # Name the dictionary's keys before falling back. A keychain *result* holds
+    # v_Data; the *query* passed in to SecItemCopyMatching holds things like
+    # class/svce/r_Data and no value at all. Both are live __NSCFDictionary and
+    # both name cleanly via the ObjC runtime, so the class name cannot tell them
+    # apart — which is why five failures all looked like "a real dictionary we
+    # mishandled" when the question is whether it is the result at all.
+    r_keys = frame.EvaluateExpression(
+        f'(const char *)[[[(NSDictionary *){dict_ptr} allKeys] description] UTF8String]', opts)
+    if not r_keys.GetError().Fail():
+        keys_ptr = r_keys.GetValueAsUnsigned()
+        if keys_ptr:
+            keys = _read_cstring(process, keys_ptr, 512)
+            if keys:
+                _log(f"     ↳ dict keys: {' '.join(keys.split())}")
+
     # No v_Data — serialize the whole dictionary as binary plist
     return _serialize_and_save(frame, process, idx, dict_ptr, opts)
 
