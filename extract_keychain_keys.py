@@ -23,6 +23,10 @@ _secitem_count = 0
 _secitem_captured = 0
 _secitem_resolved = 0
 _pending_returns = {}
+# Return addresses that already carry a breakpoint. Outlives the pending queue.
+_ret_bp_addrs = set()
+# Slack for SP matching: 0 on arm64, 8 on x86_64 (the pushed return address).
+_SP_TOLERANCE = 16
 _done = False
 
 
@@ -159,8 +163,13 @@ def _on_secitem_entry(frame, bp_loc, extra_args, internal_dict):
         idx = _secitem_count
 
         target = frame.GetThread().GetProcess().GetTarget()
-        # Only set one BP per address — reuse if already pending
-        if lr not in _pending_returns:
+        # One breakpoint per return address, tracked separately from the pending
+        # queue. Keying off `_pending_returns` alone means that once a queue
+        # empties and is retired, the next call to the same address creates a
+        # *second* breakpoint there — the duplicate-breakpoint bug e39e206 fixed
+        # on the other branch.
+        if lr not in _ret_bp_addrs:
+            _ret_bp_addrs.add(lr)
             bp_ret = target.BreakpointCreateByAddress(lr)
 
             # Work around an LLDB issue triggered when a Python breakpoint
@@ -177,12 +186,23 @@ def _on_secitem_entry(frame, bp_loc, extra_args, internal_dict):
             bp_ret.SetCommandLineCommands(commands)
             bp_ret.SetAutoContinue(True)
 
+        if lr not in _pending_returns:
             _pending_returns[lr] = []
+
+        # The stack pointer at entry identifies *this* invocation. The return
+        # address does not: every SecItemCopyMatching call from that site shares
+        # it, including the ones skipped above for being neither FMF nor FMIP.
+        # Matching on order alone lets an unrelated call consume our entry.
+        try:
+            sp = frame.GetSP()
+        except Exception:
+            sp = 0
 
         _pending_returns[lr].append({
             "result_out_ptr": result_out_ptr,
             "index": idx,
             "service": service,
+            "sp": sp,
         })
     except Exception as e:
         _log(f"  ⚠️  entry handler exception: {e}")
@@ -227,42 +247,134 @@ def _on_secitem_return(frame, bp_loc, extra_args, internal_dict):
         return False
 
 
+def _secitem_file_exists(service):
+    """Has this service already been captured to disk?
+
+    v1's idempotence trick, ported. It is what makes a duplicate return, a
+    retry, or a relaunch harmless — the capture is attempted at most once per
+    service, and every later return for it is a no-op instead of a second write
+    or a discarded entry.
+    """
+    if not service:
+        return False
+    try:
+        return (OUT_DIR / f"{service}.bplist").exists()
+    except Exception:
+        return False
+
+
 def _handle_secitem_return(frame):
+    """Match this return to the call that queued it, and capture.
+
+    Never consumes an entry that did not belong to this return. The old FIFO
+    `queue.pop(0)` assumed returns arrive in call order and only from calls we
+    armed; on a shared return address both are false, so an unrelated call would
+    pop the entry belonging to the one we wanted, read *its* OSStatus, fail the
+    status check and discard it. The real return then found an empty queue and
+    the key was silently lost — 3 runs in 10 on arm64 / lldb 1703.
+
+    Matching is by stack pointer, which identifies the invocation where the
+    return address cannot. An entry is dropped only once its file exists.
+    """
     global _secitem_captured, _secitem_resolved
 
     pc = frame.GetPC()
     pc_stripped = _strip_pac(frame, pc)
-    queue = _pending_returns.get(pc) or _pending_returns.get(pc_stripped)
+    addr = pc if pc in _pending_returns else pc_stripped
+    queue = _pending_returns.get(addr)
     if not queue:
+        _log(f"  ⚠️  return fired at 0x{pc_stripped:x} with nothing queued")
         return False
 
-    ctx = queue.pop(0)  # FIFO — oldest call returns first
-    # Clean up empty queues so the BP can be removed
-    addr = pc if pc in _pending_returns else pc_stripped
-    if addr in _pending_returns and not _pending_returns[addr]:
-        del _pending_returns[addr]
+    try:
+        sp_now = frame.GetSP()
+    except Exception:
+        sp_now = 0
 
+    # Match by stack pointer, with a small tolerance rather than equality: the
+    # two are not the same number on both architectures. On arm64 the return
+    # address lives in LR, so SP at the callee's first instruction equals SP in
+    # the caller after the return. On x86_64 the `call` has pushed the return
+    # address, so entry SP is 8 lower than it will be at the return site.
+    # Requiring equality would match on Apple Silicon and match nothing at all
+    # on Intel — the same shape of arch-specific assumption as the variadic
+    # open() bug, which also worked on exactly one architecture.
+    candidates = [c for c in queue
+                  if c.get("sp") and abs(c["sp"] - sp_now) <= _SP_TOLERANCE]
+    ctx = min(candidates, key=lambda c: abs(c["sp"] - sp_now)) if candidates else None
+    if ctx is None:
+        # Nothing recorded an SP — degrade to the old ordering rather than to
+        # capturing nothing.
+        ctx = next((c for c in queue if not c.get("sp")), None)
+    if ctx is None:
+        # A call we never armed returning through the shared address. Ignoring
+        # it is the whole point: it must not consume anybody else's entry.
+        _log(f"  ·  unmatched return at 0x{pc_stripped:x} (sp=0x{sp_now:x}) — ignored")
+        return False
+
+    service = ctx.get("service")
     _secitem_resolved += 1
     process = frame.GetThread().GetProcess()
     idx = ctx["index"]
     result_out_ptr = ctx["result_out_ptr"]
 
-    # Return register (x0/rax) holds OSStatus; 0 = success
-    status = _retval_signed(frame)
-    if status != 0:
+    def _retire():
+        """Drop the entry, and the queue with it once empty."""
+        try:
+            queue.remove(ctx)
+        except ValueError:
+            pass
+        if addr in _pending_returns and not _pending_returns[addr]:
+            del _pending_returns[addr]
+
+    # Already captured on an earlier attempt — v1's idempotence trick, which is
+    # what makes a retry or a duplicate return harmless rather than destructive.
+    if _secitem_file_exists(service):
+        _retire()
         return False
 
-    # Read result pointer from the output parameter (caller's stack location)
+    status = _retval_signed(frame)
+    if status != 0:
+        # Leave the entry in place. This return may not be the one that belongs
+        # to it, and even if it is, a later call for the same service can still
+        # succeed. Discarding here is what lost the key before.
+        _log(f"  ⚠️  [{service}] OSStatus {status} — entry kept for a later return")
+        return False
+
+    # Success is measured by the counter, not the return value: both
+    # _save_secitem_result and _try_secitem_objc_dump return False even when
+    # they capture, because their return value is a breakpoint-callback answer
+    # ("do not stop"), not a result. Retiring on the return value would keep
+    # every entry alive forever, including captured ones.
+    before = _secitem_captured
+
     ptr_bytes = _read_mem(process, result_out_ptr, 8)
     if not ptr_bytes:
-        return _try_secitem_objc_dump(frame, process, idx)
+        _try_secitem_objc_dump(frame, process, idx)
+        if _secitem_captured > before:
+            _retire()
+            return False
+        _log(f"  ⚠️  [{service}] result slot unreadable at 0x{result_out_ptr:x}"
+             " — entry kept")
+        return False
 
     data_ptr = struct.unpack('<Q', ptr_bytes)[0]
     data_ptr = _strip_pac(frame, data_ptr)
     if not data_ptr:
+        _log(f"  ⚠️  [{service}] result slot held a null pointer — entry kept")
         return False
 
-    return _save_secitem_result(frame, process, idx, data_ptr)
+    _save_secitem_result(frame, process, idx, data_ptr)
+    if _secitem_captured > before:
+        _retire()
+        return False
+
+    # _save_secitem_result has around a dozen silent `return False` paths. Rather
+    # than instrument each one, report the outcome here — one line at the caller,
+    # naming the service and what it was handed. A pointer that reaches here and
+    # yields nothing is the signature of a return that was not ours.
+    _log(f"  ⚠️  [{service}] result 0x{data_ptr:x} yielded no key — entry kept")
+    return False
 
 
 def _try_secitem_objc_dump(frame, process, idx):
