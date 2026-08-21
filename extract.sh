@@ -95,6 +95,18 @@ WAIT_SECONDS="${FINDMY_WAIT_SECONDS:-180}"
 ELAPSED=0
 # How many times to reattach if the locateagent session dies without the key.
 LOCATE_RETRIES=2
+# EXPERIMENT: how many times to relaunch Find My when it never asks for a key,
+# and how long to wait after the first keychain read for the second one.
+FINDMY_RELAUNCHES=3
+# Proportional to the wait, not a fixed number of seconds. 10s was derived on an
+# M4 Max, where FMF and FMIP arrive within a second of each other — but the whole
+# reason the default wait is 180 is that on a 2014 mini the two reads land tens
+# of seconds apart, which is what made 45s too short there. A fixed 10s grace
+# would relaunch that machine moments before it was about to succeed, turning a
+# slow success into a failure. A quarter of the budget gives 45s at the default
+# and 11s at --wait 45, which is what was measured here.
+READ_GRACE=$((WAIT_SECONDS / 4))
+[ "$READ_GRACE" -lt 8 ] && READ_GRACE=8
 
 if [ "$DO_SETUP" = "1" ]; then
     echo ""
@@ -254,16 +266,26 @@ arm_locateagent() {
 : > "$LOG1"
 arm_locateagent
 
-sudo lldb --wait-for -n FindMy \
-    -o "settings set frame-format ''" \
-    -o "settings set auto-confirm true" \
-    -o "command script import $SCRIPT_DIR/extract_keychain_keys.py" \
-    -o "process continue" \
-    -o "process continue" \
-    -o "process continue" \
-    -o "process continue" \
-    -o "process continue" > "$LOG2" 2>&1 &
-PID2=$!
+# EXPERIMENT: the FindMy side is armed through a function so the app can be
+# relaunched mid-run. Measured on an M4 Max over 40 runs, the dominant failure
+# is not a capture that goes wrong — it is Find My never asking the keychain for
+# a key at all: 6 runs in 20 skipped one or both reads, interspersed with clean
+# ones. No key has ever arrived later than 22s, and never after the 30s mark, so
+# waiting cannot recover it. A fresh launch can.
+arm_findmy() {
+    sudo lldb --wait-for -n FindMy \
+        -o "settings set frame-format ''" \
+        -o "settings set auto-confirm true" \
+        -o "command script import $SCRIPT_DIR/extract_keychain_keys.py" \
+        -o "process continue" \
+        -o "process continue" \
+        -o "process continue" \
+        -o "process continue" \
+        -o "process continue" >> "$LOG2" 2>&1 &
+    PID2=$!
+}
+: > "$LOG2"
+arm_findmy
 
 # ── Give the lldb waiters a moment to install themselves ──────────────────
 sleep 1
@@ -279,7 +301,22 @@ kick_locateagent() {
 }
 kick_locateagent
 sleep 1
-open /System/Applications/FindMy.app
+
+launch_findmy() {
+    open /System/Applications/FindMy.app
+    LAST_LAUNCH_AT="${ELAPSED:-0}"
+}
+launch_findmy
+
+relaunch_findmy() {
+    pkill -9 FindMy 2>/dev/null || true
+    sleep 0.5
+    echo "" >> "$LOG2"
+    echo "──── relaunch ────" >> "$LOG2"
+    arm_findmy
+    sleep 1
+    launch_findmy
+}
 
 # ── Wait for keys (scripts kill targets when done) ────────────────────────
 for _ in $(seq 1 "$WAIT_SECONDS"); do
@@ -378,6 +415,52 @@ for _ in $(seq 1 "$WAIT_SECONDS"); do
         [ -t 1 ] && printf '\r\033[2K'
         echo "  ⚠️  the FindMy session ended after ${ELAPSED}s without capturing"
         echo "      both keychain keys — see ./logs/lldb_findmy.log"
+    fi
+
+    # EXPERIMENT: relaunch Find My when a key was never requested.
+    #
+    # The trigger is anchored to the first read actually happening, not to the
+    # clock, because how long Find My takes to get there is exactly what varies
+    # between an M4 Max and a VM — a fixed deadline would relaunch a slow
+    # machine that was about to succeed. Once one read has landed, though, the
+    # other belongs to the same startup sequence: in every observed case they
+    # arrived within a second of each other, or the second never came at all.
+    # So a grace period after the first read is a hardware-independent signal
+    # that the second is not coming.
+    #
+    # The both-missing case has no first read to anchor to, so it falls back to
+    # the clock, at half the wait budget — still generous against the 22s
+    # worst-case observed here, and it only costs a slow machine one relaunch.
+    if [ "$KC_PENDING" = "1" ] && [ "${FINDMY_RELAUNCHES:-0}" -gt 0 ]; then
+        # Reads *since the last relaunch*, not since the run started. A plain
+        # grep -c would still see the previous attempt's read, set the anchor
+        # immediately, and fire the next relaunch a grace period later without
+        # the new launch ever having been given a chance.
+        READS_NOW=$(awk '/──── relaunch ────/{n=0} /SecItemCopyMatching \[/{n++} END{print n+0}' "$LOG2" 2>/dev/null || echo 0)
+        if [ "${READS_NOW:-0}" -gt 0 ] && [ -z "${FIRST_READ_AT:-}" ]; then
+            FIRST_READ_AT="$ELAPSED"
+        fi
+
+        RELAUNCH=0
+        if [ -n "${FIRST_READ_AT:-}" ]; then
+            [ $((ELAPSED - FIRST_READ_AT)) -ge "$READ_GRACE" ] && RELAUNCH=1
+        elif [ $((ELAPSED - ${LAST_LAUNCH_AT:-0})) -ge $((WAIT_SECONDS / 2)) ]; then
+            RELAUNCH=1
+        fi
+
+        if [ "$RELAUNCH" = "1" ]; then
+            FINDMY_RELAUNCHES=$((FINDMY_RELAUNCHES - 1))
+            [ -t 1 ] && printf '\r\033[2K'
+            MISSING=""
+            for NAME in FMFDataManager FMIPDataManager; do
+                [ -f "$KEYS_DIR/$NAME.bplist" ] || MISSING="$MISSING $NAME"
+            done
+            echo "  ↻  Find My did not ask for:$MISSING — relaunching it"
+            unset FIRST_READ_AT
+            relaunch_findmy
+            ELAPSED=$((ELAPSED + 2))
+            continue
+        fi
     fi
 
     # Nothing left that could still arrive.
