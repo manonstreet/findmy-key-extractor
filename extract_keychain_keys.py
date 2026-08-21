@@ -26,8 +26,6 @@ _secitem_resolved = 0
 _pending_returns = {}
 # Return addresses that already carry a breakpoint. Outlives the pending queue.
 _ret_bp_addrs = set()
-# Slack for SP matching: 0 on arm64, 8 on x86_64 (the pushed return address).
-_SP_TOLERANCE = 16
 _done = False
 
 
@@ -201,14 +199,6 @@ def _on_secitem_entry(frame, bp_loc, extra_args, internal_dict):
         if lr not in _pending_returns:
             _pending_returns[lr] = []
 
-        # The stack pointer at entry identifies *this* invocation. The return
-        # address does not: every SecItemCopyMatching call from that site shares
-        # it, including the ones skipped above for being neither FMF nor FMIP.
-        # Matching on order alone lets an unrelated call consume our entry.
-        try:
-            sp = frame.GetSP()
-        except Exception:
-            sp = 0
 
         _pending_returns[lr].append({
             "result_out_ptr": result_out_ptr,
@@ -220,7 +210,6 @@ def _on_secitem_entry(frame, bp_loc, extra_args, internal_dict):
             # timing problem and a matching problem, and nothing else we have
             # logged can tell those apart.
             "query_ptr": _strip_pac(frame, query_ptr),
-            "sp": sp,
         })
     except Exception as e:
         _log(f"  ⚠️  entry handler exception: {e}")
