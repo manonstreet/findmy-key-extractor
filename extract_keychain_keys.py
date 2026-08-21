@@ -26,6 +26,13 @@ _secitem_resolved = 0
 _pending_returns = {}
 # Return addresses that already carry a breakpoint. Outlives the pending queue.
 _ret_bp_addrs = set()
+# The breakpoint objects themselves, so they can be switched off while we
+# evaluate expressions. SetIgnoreBreakpoints(True) is set on every options
+# object and is demonstrably not suppressing these hits — every expression,
+# starting with the first, still dies with 'Execution was interrupted,
+# reason: breakpoint 2.1', which is this very breakpoint. Disabling it is
+# not a flag we hope is honoured; it is a state we control.
+_ret_bp_objs = []
 # Slack for SP matching: 0 on arm64, 8 on x86_64 (the pushed return address).
 _SP_TOLERANCE = 16
 _done = False
@@ -183,6 +190,7 @@ def _on_secitem_entry(frame, bp_loc, extra_args, internal_dict):
         if lr not in _ret_bp_addrs:
             _ret_bp_addrs.add(lr)
             bp_ret = target.BreakpointCreateByAddress(lr)
+            _ret_bp_objs.append(bp_ret)
 
             # Work around an LLDB issue triggered when a Python breakpoint
             # callback installs another Python breakpoint callback.
@@ -315,6 +323,15 @@ def _handle_secitem_return(frame):
     # failures measured on this branch.
     _log(f"  ⋯  capturing ({len(queue)} pending)")
 
+    # Evaluating an expression runs target code that passes through this same
+    # return address. We are already inside this breakpoint's handler, so it has
+    # nothing left to tell us for the duration of the capture.
+    for _bp in _ret_bp_objs:
+        try:
+            _bp.SetEnabled(False)
+        except Exception:
+            pass
+
     _secitem_resolved += 1
     process = frame.GetThread().GetProcess()
     captured_any = False
@@ -341,6 +358,12 @@ def _handle_secitem_return(frame):
 
     # Quiet when something was captured — the ✅ line already says so. Loud only
     # when a return produced nothing, which is the case that loses keys.
+    for _bp in _ret_bp_objs:
+        try:
+            _bp.SetEnabled(True)
+        except Exception:
+            pass
+
     if not captured_any and tried:
         _log("  ⚠️  return captured nothing — " + "; ".join(tried))
 
