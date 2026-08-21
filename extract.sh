@@ -511,7 +511,29 @@ while [ "$ELAPSED" -lt "$BUDGET" ]; do
                 [ "$AT" -gt "$NEWEST_READ" ] && NEWEST_READ="$AT"
             done
 
-            if [ "$NEWEST_READ" -gt -999 ] &&
+            # The read timestamp is a poor proxy for "a capture is in flight".
+            # The read is logged at the *entry* breakpoint; the capture happens
+            # at the *return*, and in this variant that means Python driving
+            # several ObjC message sends, each with a five second expression
+            # timeout. One return can evaluate for 10-20s — well past any settle
+            # window anchored to the read — and `pkill -9` lands in the middle of
+            # it. Measured: three barren returns, all reporting
+            # "Execution was interrupted, reason: signal SIGKILL" from inside
+            # objectForKey, followed by "unexpected state" and "No value" from
+            # every expression after, because the process was gone.
+            #
+            # The session writing to its log is the real signal that something is
+            # happening in it. Use that directly.
+            LOG_AGE=$(( $(date +%s) - $(stat -f %m "$LOG2" 2>/dev/null || echo 0) ))
+            if [ "$LOG_AGE" -lt "$CAPTURE_SETTLE" ]; then
+                RELAUNCH=0
+                if [ -z "${SAID_BUSY:-}" ]; then
+                    SAID_BUSY=1
+                    [ -t 1 ] && printf '\r\033[2K'
+                    echo "  …  the FindMy session wrote ${LOG_AGE}s ago — still"
+                    echo "      working; holding off the relaunch"
+                fi
+            elif [ "$NEWEST_READ" -gt -999 ] &&
                [ $((ELAPSED - NEWEST_READ)) -lt "$CAPTURE_SETTLE" ]; then
                 RELAUNCH=0
                 if [ -z "${SAID_INFLIGHT:-}" ]; then
