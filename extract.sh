@@ -346,6 +346,13 @@ relaunch_findmy() {
 # window closed and the run ended before the return could fire. The remedy was
 # starving itself, and the failure looked like a capture defect.
 BUDGET="$WAIT_SECONDS"
+# Real seconds, from the clock. ELAPSED used to count loop iterations and was
+# treated everywhere as if it were seconds. Each iteration runs a copy pass, an
+# awk over the lldb log per missing key, a stat, a date and two kill -0 checks
+# before sleeping 1s — on a 2014 mini that is about 1.4s per "second". A run
+# predicted to end at 255s took 358s, and every derived parameter was inflated
+# the same way: --wait 180 meant ~250s, CAPTURE_SETTLE 15 meant ~21s.
+LOOP_START=$(date +%s)
 while [ "$ELAPSED" -lt "$BUDGET" ]; do
     # Copy any FMF/FMIP bplists out of FindMy's sandbox container as soon
     # as they show up (extract_keychain_keys.py can't write $KEYS_DIR
@@ -370,7 +377,7 @@ while [ "$ELAPSED" -lt "$BUDGET" ]; do
         fi
     done
 
-    ELAPSED=$((ELAPSED + 1))
+    ELAPSED=$(( $(date +%s) - LOOP_START ))
 
     # Note when each key first lands. This is the only capture-timing signal
     # that works on both variants: v1 captures inside a C breakpoint condition
@@ -582,7 +589,6 @@ while [ "$ELAPSED" -lt "$BUDGET" ]; do
             echo "  ↻  Find My did not ask for:$MISSING — relaunching it"
             unset FIRST_READ_AT
             relaunch_findmy
-            ELAPSED=$((ELAPSED + 2))
             # Grant the fresh attempt its own time rather than billing it to
             # what is left. Capped so a pathological run still terminates.
             BUDGET=$((BUDGET + ATTEMPT_BUDGET))
