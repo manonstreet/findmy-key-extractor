@@ -107,6 +107,8 @@ FINDMY_RELAUNCHES=3
 # and 11s at --wait 45, which is what was measured here.
 # How long a capture is given to finish after its read before the relaunch
 # is allowed to kill the process. Protects the in-flight window, nothing more.
+# Time granted to each relaunched attempt. A clean capture lands in 7-15s.
+ATTEMPT_BUDGET=25
 CAPTURE_SETTLE=8
 READ_GRACE=$((WAIT_SECONDS / 4))
 [ "$READ_GRACE" -lt 8 ] && READ_GRACE=8
@@ -332,7 +334,14 @@ relaunch_findmy() {
 }
 
 # ── Wait for keys (scripts kill targets when done) ────────────────────────
-for _ in $(seq 1 "$WAIT_SECONDS"); do
+# Budget in seconds, not a fixed iteration count, because a relaunch has to be
+# able to extend it. Relaunching to recover a missing read is pointless if the
+# relaunch spends the time the fresh attempt needs: measured at --wait 45 with
+# three relaunches, the last attempt got its keychain read one line before the
+# window closed and the run ended before the return could fire. The remedy was
+# starving itself, and the failure looked like a capture defect.
+BUDGET="$WAIT_SECONDS"
+while [ "$ELAPSED" -lt "$BUDGET" ]; do
     # Copy any FMF/FMIP bplists out of FindMy's sandbox container as soon
     # as they show up (extract_keychain_keys.py can't write $KEYS_DIR
     # directly from inside the sandboxed process).
@@ -525,6 +534,10 @@ for _ in $(seq 1 "$WAIT_SECONDS"); do
             unset FIRST_READ_AT
             relaunch_findmy
             ELAPSED=$((ELAPSED + 2))
+            # Grant the fresh attempt its own time rather than billing it to
+            # what is left. Capped so a pathological run still terminates.
+            BUDGET=$((BUDGET + ATTEMPT_BUDGET))
+            [ "$BUDGET" -gt $((WAIT_SECONDS * 3)) ] && BUDGET=$((WAIT_SECONDS * 3))
             continue
         fi
     fi
