@@ -112,7 +112,9 @@ FINDMY_RELAUNCHES=3
 # is allowed to kill the process. Protects the in-flight window, nothing more.
 # Time granted to each relaunched attempt. A clean capture lands in 7-15s.
 ATTEMPT_BUDGET=25
-CAPTURE_SETTLE=8
+# Must exceed the worst-case capture handler duration or the gate opens while a
+# capture is still running. Six expressions at a 1.5s timeout is about 9s.
+CAPTURE_SETTLE=15
 READ_GRACE=$((WAIT_SECONDS / 4))
 [ "$READ_GRACE" -lt 8 ] && READ_GRACE=8
 
