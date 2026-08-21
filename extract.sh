@@ -144,6 +144,26 @@ if ! have_deps; then
     exit 1
 fi
 
+# ── Refuse to run alongside FindMySyncPlus ────────────────────────────────
+# FMS+ launches and kills the Find My app on a timer to force a cache refresh
+# (autoLaunchKillFindMy). This script attaches to and kills the same process, so
+# the two fight: lldb sessions die mid-capture and keys go missing at random.
+# The resulting failures look exactly like a bug in here, so stop rather than
+# produce a misleading result.
+if pgrep -qx FindMySyncPlus 2>/dev/null; then
+    echo ""
+    echo "  ❌  FindMySyncPlus is running."
+    echo ""
+    echo "      It launches and kills the Find My app on a timer, which"
+    echo "      interferes with key extraction and causes keys to be missed"
+    echo "      at random. Quit it, then run this again."
+    echo ""
+    echo "      (Turning the scheduler off is not enough if the app is open —"
+    echo "       quit it entirely.)"
+    echo ""
+    exit 1
+fi
+
 # ── Prime sudo (before banner so password prompt isn't buried) ────────────
 sudo -v
 

@@ -91,6 +91,15 @@ That is a regression in **lldb 1700** (Xcode 16): installing a second Python
 breakpoint callback from inside a running one crashes. Multiple people have hit
 it. Check your version with `lldb --version` and say so in your issue.
 
+### Keys go missing at random, with no error
+
+Check whether **FindMySyncPlus is running**. It launches and kills the Find My
+app on a timer to force a cache refresh, and this tool attaches to and kills the
+same process — so the two fight, lldb sessions die mid-capture, and which keys
+survive is luck. Quit FMS+ entirely (turning off its scheduler is not enough if
+the app is still open) and run again. `extract.sh` now refuses to start when it
+sees FMS+ running.
+
 ### Some keys captured, others not — and the Debug section is empty
 
 An empty Debug block means nothing crashed; the run simply ended before Find My
