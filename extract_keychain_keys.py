@@ -56,6 +56,14 @@ import struct
 
 _bp_secitem = None
 _secitem_count = 0
+# Return-address -> breakpoint. FMF and FMIP return through the *same* call
+# site, so arming a fresh breakpoint per call leaves the earlier one live with
+# a condition that still points at the previous call's result slot. That slot is
+# stack memory which has since been reused, so the condition dereferences
+# garbage, the expression errors, and an erroring condition counts as a *stop* —
+# which ends the batch-mode session and loses the capture. Keep one breakpoint
+# per address and swap its condition instead.
+_ret_bps = {}
 
 
 def _log(msg):
@@ -204,7 +212,7 @@ def _capture_condition(result_out_ptr, filename, retval_reg):
 
 
 def _on_secitem_entry(frame, bp_loc, extra_args, internal_dict):
-    global _secitem_count
+    global _secitem_count, _ret_bps
 
     try:
         query_ptr = _arg(frame, 0)
@@ -226,12 +234,13 @@ def _on_secitem_entry(frame, bp_loc, extra_args, internal_dict):
         target = frame.GetThread().GetProcess().GetTarget()
         filename = f"{service}.bplist"
 
-        # Each call gets its own breakpoint object even though FMF/FMIP
-        # calls happen to share the same return address here — plain
-        # breakpoint creation is safe to do nested (unlike wiring a script
-        # callback), and each condition only touches its own result slot.
+        # FMF and FMIP share this return address, so reuse the breakpoint and
+        # replace its condition rather than stacking a second one (see _ret_bps).
         retval_reg = "rax" if _is_x86(frame) else "x0"
-        bp_ret = target.BreakpointCreateByAddress(lr)
+        bp_ret = _ret_bps.get(lr)
+        if bp_ret is None or not bp_ret.IsValid():
+            bp_ret = target.BreakpointCreateByAddress(lr)
+            _ret_bps[lr] = bp_ret
         bp_ret.SetCondition(_capture_condition(result_out_ptr, filename, retval_reg))
         _log(f"  🛠️  armed capture for [{service}] at 0x{lr:x} → (sandbox tmp)/{filename}")
     except Exception as e:
