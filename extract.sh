@@ -587,6 +587,14 @@ while [ "$ELAPSED" -lt "$BUDGET" ]; do
             # what is left. Capped so a pathological run still terminates.
             BUDGET=$((BUDGET + ATTEMPT_BUDGET))
             [ "$BUDGET" -gt $((WAIT_SECONDS * 3)) ] && BUDGET=$((WAIT_SECONDS * 3))
+            # Once this was the last relaunch, give the fresh attempt its window
+            # and then stop. Waiting out the remaining budget afterwards buys
+            # nothing — no further relaunch can fire and the read is not coming.
+            # On a machine with the 180s default that dead tail was over a
+            # minute per failed run, which reads as a hang.
+            if [ "$FINDMY_RELAUNCHES" -eq 0 ]; then
+                BUDGET=$((ELAPSED + ATTEMPT_BUDGET))
+            fi
             continue
         fi
     fi
