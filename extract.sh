@@ -33,7 +33,7 @@ FINDMY_TMP_DIR="$HOME/Library/Containers/com.apple.findmy/Data/tmp"
 # Keep the lldb logs when a run fails. They are the only record of *why* — a
 # Python traceback from a breakpoint callback appears nowhere else — and deleting
 # them unconditionally is why past failures took weeks to diagnose.
-KEEP_LOGS=0
+KEEP_LOGS="${KEEP_LOGS:-0}"
 cleanup() {
     if [ "$KEEP_LOGS" = "1" ]; then
         mkdir -p "$SCRIPT_DIR/logs"
@@ -184,11 +184,42 @@ pkill -9 FindMy 2>/dev/null || true
 sleep 0.5
 
 # ── Prepare output directory ─────────────────────────────────────────────
+# Every key from the previous run must actually be gone before we start. If one
+# survives, the wait loop below sees three files on its first iteration, breaks
+# immediately, and the run reports success having captured nothing — and the
+# verification step passes too, because Find My keys are stable across reboots,
+# so last month's key still decrypts today's cache. Three green ticks, no
+# extraction. Deleting a file needs write permission on the *directory*, so this
+# happens whenever keys/ is left owned by root, which is what older versions of
+# this script did before they chowned what they wrote.
 mkdir -p "$KEYS_DIR"
 rm -f "$KEYS_DIR"/LocalStorage.key
 rm -f "$KEYS_DIR"/LocalStorage.key.candidate
 rm -f "$KEYS_DIR"/*.bplist
 rm -f "$FINDMY_TMP_DIR"/*.bplist 2>/dev/null || true
+
+STALE=""
+for f in "$KEYS_DIR"/LocalStorage.key "$KEYS_DIR"/LocalStorage.key.candidate "$KEYS_DIR"/*.bplist; do
+    [ -e "$f" ] && STALE="$STALE  $f\n"
+done
+if [ -n "$STALE" ]; then
+    echo ""
+    echo "  ❌  Could not clear the previous run's keys from ./keys/"
+    echo ""
+    printf "%b" "$STALE"
+    echo "      Owner of ./keys/: $(stat -f %Su "$KEYS_DIR")   you: $(whoami)"
+    echo ""
+    echo "      Removing a file needs write permission on the directory that"
+    echo "      holds it, so a keys/ owned by root cannot be cleared by you."
+    echo "      Left alone, this run would find those files still in place,"
+    echo "      stop immediately, and report success without extracting"
+    echo "      anything — old keys still verify, because Find My keys do not"
+    echo "      change across reboots."
+    echo ""
+    echo "      Fix it with:  sudo chown -R $(whoami) $KEYS_DIR"
+    echo ""
+    exit 1
+fi
 
 # ── Launch both lldb sessions in parallel — they enter --wait-for state ───
 sudo lldb --wait-for -n findmylocateagent \
@@ -227,7 +258,19 @@ for _ in $(seq 1 "$WAIT_SECONDS"); do
         SRC="$FINDMY_TMP_DIR/$NAME.bplist"
         DST="$KEYS_DIR/$NAME.bplist"
         if [ -f "$SRC" ] && [ ! -f "$DST" ]; then
-            cp "$SRC" "$DST" 2>/dev/null || true
+            # A silent `cp` here cost a full test cycle: the capture succeeded,
+            # the file was written into the sandbox with an unreadable mode, and
+            # the copy failed with its error discarded — so the run looked like
+            # the capture had never fired at all. Report it, and try to recover
+            # by fixing the mode, since the file belongs to us either way.
+            if ! cp "$SRC" "$DST" 2>/dev/null; then
+                chmod u+r "$SRC" 2>/dev/null || true
+                if ! cp "$SRC" "$DST" 2>/dev/null; then
+                    echo ""
+                    echo "  ⚠️  captured $NAME.bplist but could not copy it out of"
+                    echo "      FindMy's container: $(stat -f 'mode=%Sp owner=%Su' "$SRC" 2>/dev/null)"
+                fi
+            fi
         fi
     done
 
@@ -281,7 +324,15 @@ for NAME in FMFDataManager FMIPDataManager; do
     SRC="$FINDMY_TMP_DIR/$NAME.bplist"
     DST="$KEYS_DIR/$NAME.bplist"
     if [ -f "$SRC" ] && [ ! -f "$DST" ]; then
-        cp "$SRC" "$DST" 2>/dev/null || true
+        # Last chance to recover a capture — same silent-cp trap as above.
+        if ! cp "$SRC" "$DST" 2>/dev/null; then
+            chmod u+r "$SRC" 2>/dev/null || true
+            if ! cp "$SRC" "$DST" 2>/dev/null; then
+                echo ""
+                echo "  ⚠️  captured $NAME.bplist but could not copy it out of"
+                echo "      FindMy's container: $(stat -f 'mode=%Sp owner=%Su' "$SRC" 2>/dev/null)"
+            fi
+        fi
     fi
 done
 
