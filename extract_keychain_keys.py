@@ -294,6 +294,7 @@ def _handle_secitem_return(frame):
     process = frame.GetThread().GetProcess()
     captured_any = False
 
+    tried = []
     for ctx in list(queue):
         service = ctx.get("service")
 
@@ -301,16 +302,22 @@ def _handle_secitem_return(frame):
             _retire_entry(addr, ctx)
             continue
 
-        before = _secitem_captured
         try:
-            _attempt_capture(frame, process, ctx)
+            reason = _attempt_capture(frame, process, ctx)
         except Exception as e:
-            _log(f"  ⚠️  [{service}] capture attempt raised: {e}")
+            tried.append(f"{service}: raised {e}")
             continue
 
-        if _secitem_captured > before:
+        if reason is None:
             _retire_entry(addr, ctx)
             captured_any = True
+        else:
+            tried.append(f"{service}: {reason}")
+
+    # Quiet when something was captured — the ✅ line already says so. Loud only
+    # when a return produced nothing, which is the case that loses keys.
+    if not captured_any and tried:
+        _log("  ⚠️  return captured nothing — " + "; ".join(tried))
 
     return captured_any
 
@@ -329,28 +336,37 @@ def _retire_entry(addr, ctx):
 
 
 def _attempt_capture(frame, process, ctx):
-    """One capture attempt for one pending call. Silent on a miss by design —
-    with several entries tried per return, misses are the normal case and
-    logging each one would bury the real events."""
-    service = ctx.get("service")
+    """One capture attempt for one pending call.
+
+    Returns None on success, or a short reason string. The reason is what makes
+    a failed return diagnosable: with several entries tried per return a miss is
+    the normal case, so the caller reports only returns where *nothing* was
+    captured — and then it has to say why each attempt failed, or the failure is
+    exactly as opaque as the silent `return False` this replaced.
+    """
+    global _secitem_captured
+
     idx = ctx["index"]
     result_out_ptr = ctx["result_out_ptr"]
 
     status = _retval_signed(frame)
     if status != 0:
-        return
+        return f"OSStatus {status}"
 
     ptr_bytes = _read_mem(process, result_out_ptr, 8)
     if not ptr_bytes:
+        before = _secitem_captured
         _try_secitem_objc_dump(frame, process, idx)
-        return
+        return None if _secitem_captured > before else f"slot 0x{result_out_ptr:x} unreadable"
 
     data_ptr = struct.unpack('<Q', ptr_bytes)[0]
     data_ptr = _strip_pac(frame, data_ptr)
     if not data_ptr:
-        return
+        return "slot held null"
 
+    before = _secitem_captured
     _save_secitem_result(frame, process, idx, data_ptr)
+    return None if _secitem_captured > before else f"ptr 0x{data_ptr:x} yielded no key"
 
 
 def _try_secitem_objc_dump(frame, process, idx):
