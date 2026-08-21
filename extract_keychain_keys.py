@@ -217,8 +217,15 @@ def _capture_condition(result_out_ptr, filename, retval_reg):
         "  unsigned long len = (unsigned long)[(NSData *)dataObj length]; "
         "  void *bytes = (void *)[(NSData *)dataObj bytes]; "
         "  if (len > 0 && len < 1000000 && bytes) { "
+        # open() is variadic in its third argument. On arm64 Apple platforms
+        # variadic arguments are passed on the *stack*, not in registers, so the
+        # mode never reaches the callee and the file is created with whatever was
+        # in that stack slot — observed as 0110, unreadable even by its owner, so
+        # the copy-out in extract.sh silently found nothing to copy. On x86_64
+        # variadic args go in registers like any other, which is why this worked
+        # on every Intel machine that ran it. fchmod is not variadic.
         "    int fd = (int)open(path, 1537, 384); "
-        "    if (fd >= 0) { (long)write(fd, bytes, len); (int)close(fd); } "
+        "    if (fd >= 0) { (int)fchmod(fd, 384); (long)write(fd, bytes, len); (int)close(fd); } "
         "  } "
         "} "
     )
