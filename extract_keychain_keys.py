@@ -131,6 +131,12 @@ def _query_service_name(frame, query_ptr):
     opts = lldb.SBExpressionOptions()
     opts.SetTimeoutInMicroSeconds(1_500_000)
     opts.SetTryAllThreads(False)
+    # Evaluating an expression runs real code in the target. Our own return
+    # breakpoint sits on a shared return address that ObjC message sends pass
+    # through, so without this the capture interrupts itself:
+    #   Execution was interrupted, reason: breakpoint 2.1
+    # It is not a timeout, so the expression timeout never applied either.
+    opts.SetIgnoreBreakpoints(True)
     opts.SetLanguage(lldb.eLanguageTypeObjC)
     process = frame.GetThread().GetProcess()
     query_ptr = _strip_pac(frame, query_ptr)
@@ -438,6 +444,12 @@ def opts_objc(frame):
     o = lldb.SBExpressionOptions()
     o.SetTimeoutInMicroSeconds(1_500_000)
     o.SetTryAllThreads(False)
+    # Evaluating an expression runs real code in the target. Our own return
+    # breakpoint sits on a shared return address that ObjC message sends pass
+    # through, so without this the capture interrupts itself:
+    #   Execution was interrupted, reason: breakpoint 2.1
+    # It is not a timeout, so the expression timeout never applied either.
+    o.SetIgnoreBreakpoints(True)
     o.SetLanguage(lldb.eLanguageTypeObjC)
     return o
 
@@ -457,6 +469,12 @@ def _try_secitem_objc_dump(frame, process, idx):
         opts = lldb.SBExpressionOptions()
         opts.SetTimeoutInMicroSeconds(1_500_000)
         opts.SetTryAllThreads(False)
+        # Evaluating an expression runs real code in the target. Our own return
+        # breakpoint sits on a shared return address that ObjC message sends pass
+        # through, so without this the capture interrupts itself:
+        #   Execution was interrupted, reason: breakpoint 2.1
+        # It is not a timeout, so the expression timeout never applied either.
+        opts.SetIgnoreBreakpoints(True)
         r = frame.EvaluateExpression(
             f'(long)CFDataGetLength((void *){candidate})', opts)
         if not r.GetError().Fail():
@@ -482,6 +500,12 @@ def _save_secitem_result(frame, process, idx, result_ptr):
     opts = lldb.SBExpressionOptions()
     opts.SetTimeoutInMicroSeconds(1_500_000)
     opts.SetTryAllThreads(False)
+    # Evaluating an expression runs real code in the target. Our own return
+    # breakpoint sits on a shared return address that ObjC message sends pass
+    # through, so without this the capture interrupts itself:
+    #   Execution was interrupted, reason: breakpoint 2.1
+    # It is not a timeout, so the expression timeout never applied either.
+    opts.SetIgnoreBreakpoints(True)
 
     # Identify the object type via ObjC runtime
     opts.SetLanguage(lldb.eLanguageTypeObjC)
@@ -642,6 +666,12 @@ def _save_cfdata(frame, process, idx, data_ptr, opts=None, name=None):
         opts = lldb.SBExpressionOptions()
         opts.SetTimeoutInMicroSeconds(1_500_000)
         opts.SetTryAllThreads(False)
+        # Evaluating an expression runs real code in the target. Our own return
+        # breakpoint sits on a shared return address that ObjC message sends pass
+        # through, so without this the capture interrupts itself:
+        #   Execution was interrupted, reason: breakpoint 2.1
+        # It is not a timeout, so the expression timeout never applied either.
+        opts.SetIgnoreBreakpoints(True)
 
     r_len = frame.EvaluateExpression(
         f'(long)CFDataGetLength((void *){data_ptr})', opts)
