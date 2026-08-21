@@ -97,8 +97,16 @@ ELAPSED=0
 LOCATE_RETRIES=2
 # EXPERIMENT: how many times to relaunch Find My when it never asks for a key,
 # and how long to wait after the first keychain read for the second one.
-FINDMY_RELAUNCHES=2
-READ_GRACE=10
+FINDMY_RELAUNCHES=3
+# Proportional to the wait, not a fixed number of seconds. 10s was derived on an
+# M4 Max, where FMF and FMIP arrive within a second of each other — but the whole
+# reason the default wait is 180 is that on a 2014 mini the two reads land tens
+# of seconds apart, which is what made 45s too short there. A fixed 10s grace
+# would relaunch that machine moments before it was about to succeed, turning a
+# slow success into a failure. A quarter of the budget gives 45s at the default
+# and 11s at --wait 45, which is what was measured here.
+READ_GRACE=$((WAIT_SECONDS / 4))
+[ "$READ_GRACE" -lt 8 ] && READ_GRACE=8
 
 if [ "$DO_SETUP" = "1" ]; then
     echo ""
