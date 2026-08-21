@@ -105,6 +105,9 @@ FINDMY_RELAUNCHES=3
 # would relaunch that machine moments before it was about to succeed, turning a
 # slow success into a failure. A quarter of the budget gives 45s at the default
 # and 11s at --wait 45, which is what was measured here.
+# How long a capture is given to finish after its read before the relaunch
+# is allowed to kill the process. Protects the in-flight window, nothing more.
+CAPTURE_SETTLE=8
 READ_GRACE=$((WAIT_SECONDS / 4))
 [ "$READ_GRACE" -lt 8 ] && READ_GRACE=8
 
@@ -469,21 +472,46 @@ for _ in $(seq 1 "$WAIT_SECONDS"); do
         # interpreter than when it is a synchronous breakpoint condition, so the
         # misfire is not evenly distributed across capture designs — which is
         # how it corrupted a comparison between two of them.
+        # Hold off relaunching only while a capture could still be in flight —
+        # a few seconds after a read — rather than for the rest of the run.
+        #
+        # The first version of this blocked permanently on any read, which was
+        # too blunt in both directions. It was global, so a read for one key
+        # blocked the remedy for the other; and it never expired, so a capture
+        # that had demonstrably failed still suppressed the relaunch that could
+        # have recovered it. Measured cost: 4 runs in 9 had a remedy available
+        # and did not use it, and it turned a 7/10 into a 6/10.
+        #
+        # Relaunching *does* recover failed captures, not just missing reads —
+        # one run captured FMIP on the third read after two relaunches. The only
+        # thing worth protecting is the brief window where the read has landed
+        # and the handler has not finished, which is what killed a capture and
+        # corrupted a comparison earlier.
         if [ "$RELAUNCH" = "1" ]; then
+            NEWEST_READ=-999
             for NAME in FMFDataManager FMIPDataManager; do
                 [ -f "$KEYS_DIR/$NAME.bplist" ] && continue
-                if [ "$(reads_this_attempt "$NAME")" -gt 0 ]; then
-                    RELAUNCH=0
-                    if [ -z "${SAID_INFLIGHT:-}" ]; then
-                        SAID_INFLIGHT=1
-                        [ -t 1 ] && printf '\r\033[2K'
-                        echo "  …  Find My did ask for $NAME — not relaunching. The"
-                        echo "      read arrived, so this is a capture problem rather"
-                        echo "      than a missing request, and killing it now would"
-                        echo "      destroy a capture that may be in flight."
-                    fi
+                N=$(reads_this_attempt "$NAME")
+                [ "$N" -eq 0 ] && continue
+                eval "PREV=\${SEEN_${NAME}:-0}"
+                if [ "$N" -ne "$PREV" ]; then
+                    eval "SEEN_${NAME}=$N"
+                    eval "AT_${NAME}=$ELAPSED"
                 fi
+                eval "AT=\${AT_${NAME}:-$ELAPSED}"
+                [ "$AT" -gt "$NEWEST_READ" ] && NEWEST_READ="$AT"
             done
+
+            if [ "$NEWEST_READ" -gt -999 ] &&
+               [ $((ELAPSED - NEWEST_READ)) -lt "$CAPTURE_SETTLE" ]; then
+                RELAUNCH=0
+                if [ -z "${SAID_INFLIGHT:-}" ]; then
+                    SAID_INFLIGHT=1
+                    [ -t 1 ] && printf '\r\033[2K'
+                    echo "  …  a keychain read landed $((ELAPSED - NEWEST_READ))s ago —"
+                    echo "      holding off the relaunch until the capture settles"
+                fi
+            fi
         fi
 
         if [ "$RELAUNCH" = "1" ]; then
