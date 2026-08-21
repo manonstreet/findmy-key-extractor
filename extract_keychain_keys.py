@@ -481,6 +481,13 @@ def _save_dict_result(frame, process, idx, dict_ptr, opts):
     # Try to get the "v_Data" key (kSecValueData) — the raw secret
     r_data = frame.EvaluateExpression(
         f'(id)[(NSDictionary *){dict_ptr} objectForKey:@"v_Data"]', opts)
+    if r_data.GetError().Fail():
+        # This is the one exit that explains a barren return logging nothing at
+        # all. object_getClassName is a plain C call needing no runtime lock and
+        # it succeeded; objectForKey: is a message send and it did not. If that
+        # is why, every ObjC send here fails together and the error will say so.
+        _log(f"     ↳ dict 0x{dict_ptr:x}: objectForKey v_Data failed "
+             f"({r_data.GetError().GetCString() or 'expression failed'})")
     if not r_data.GetError().Fail():
         v_data_ptr = _strip_pac(frame, r_data.GetValueAsUnsigned())
         if v_data_ptr:
@@ -502,6 +509,9 @@ def _save_dict_result(frame, process, idx, dict_ptr, opts):
             keys = _read_cstring(process, keys_ptr, 512)
             if keys:
                 _log(f"     ↳ dict keys: {' '.join(keys.split())}")
+    else:
+        _log(f"     ↳ dict 0x{dict_ptr:x}: allKeys failed "
+             f"({r_keys.GetError().GetCString() or 'expression failed'})")
 
     # No v_Data — serialize the whole dictionary as binary plist
     return _serialize_and_save(frame, process, idx, dict_ptr, opts)
@@ -516,9 +526,14 @@ def _serialize_and_save(frame, process, idx, obj_ptr, opts):
         f'(id)[NSPropertyListSerialization dataWithPropertyList:(id){obj_ptr}'
         f' format:200 options:0 error:nil]', opts)
     if r_ser.GetError().Fail():
+        _log(f"     ↳ serialize 0x{obj_ptr:x} failed "
+             f"({r_ser.GetError().GetCString() or 'expression failed'})")
         # Last resort: get the ObjC description string
         r_desc = frame.EvaluateExpression(
             f'(id)[(id){obj_ptr} description]', opts)
+        if r_desc.GetError().Fail():
+            _log(f"     ↳ description 0x{obj_ptr:x} failed too "
+                 f"({r_desc.GetError().GetCString() or 'expression failed'})")
         if not r_desc.GetError().Fail():
             desc_ptr = _strip_pac(frame, r_desc.GetValueAsUnsigned())
             if desc_ptr:
