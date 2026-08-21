@@ -181,8 +181,27 @@ def _capture_condition(result_out_ptr, filename, retval_reg):
         # callee often leaves *result_out_ptr untouched (stale/
         # uninitialized), so it must not be dereferenced unless the call
         # actually succeeded.
+        # Build the destination path first and bail out if it already exists.
+        #
+        # This breakpoint sits on a *return address*, so it fires for every call
+        # returning through that site — including the keychain reads we skip at
+        # entry because they are neither FMF nor FMIP. Those carry a different
+        # result slot, so dereferencing ours reads whatever now occupies that
+        # stack memory; the plausibility check below is not enough to stop
+        # object_getClassName() faulting on it (EXC_BAD_ACCESS). An erroring
+        # condition counts as a stop, which ends the batch session and loses the
+        # remaining key.
+        #
+        # Once we have captured, there is nothing left to do, so short-circuit
+        # before touching any pointer. That makes re-entry harmless.
+        "char path[1024]; "
+        "NSString *tmpDirStr0 = (NSString *)(id)NSTemporaryDirectory(); "
+        "const char *tmpDir0 = (const char *)[tmpDirStr0 UTF8String]; "
+        "(unsigned long)strlcpy(path, tmpDir0, sizeof(path)); "
+        f'(unsigned long)strlcat(path, "{escaped_name}", sizeof(path)); '
+        "int done = ((int)access(path, 0) == 0); "
         f"int status = (int)${retval_reg}; "
-        f"void *rp = (status == 0) ? (void *)0x{result_out_ptr:x} : (void *)0; "
+        f"void *rp = (!done && status == 0) ? (void *)0x{result_out_ptr:x} : (void *)0; "
         "void *dp = rp ? *(void **)rp : (void *)0; "
         "id obj = (id)dp; "
         "id dataObj = ((unsigned long)obj > 0x100000000) ? obj : (id)0; "
@@ -198,11 +217,6 @@ def _capture_condition(result_out_ptr, filename, retval_reg):
         "  unsigned long len = (unsigned long)[(NSData *)dataObj length]; "
         "  void *bytes = (void *)[(NSData *)dataObj bytes]; "
         "  if (len > 0 && len < 1000000 && bytes) { "
-        "    NSString *tmpDirStr = (NSString *)(id)NSTemporaryDirectory(); "
-        "    const char *tmpDir = (const char *)[tmpDirStr UTF8String]; "
-        "    char path[1024]; "
-        "    (unsigned long)strlcpy(path, tmpDir, sizeof(path)); "
-        f'    (unsigned long)strlcat(path, "{escaped_name}", sizeof(path)); '
         "    int fd = (int)open(path, 1537, 384); "
         "    if (fd >= 0) { (long)write(fd, bytes, len); (int)close(fd); } "
         "  } "
