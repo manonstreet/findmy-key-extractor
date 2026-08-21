@@ -23,6 +23,9 @@ KEYS_DIR="$SCRIPT_DIR/keys"
 
 LOG1=$(mktemp /tmp/lldb_locateagent.XXXXXX)
 LOG2=$(mktemp /tmp/lldb_findmy.XXXXXX)
+# Per-key capture times, kept next to the keys so a run can be timed
+# without re-deriving it from the total.
+TIMING_LOG="$SCRIPT_DIR/keys/.timing"
 
 # FindMy.app is App-Sandboxed, so extract_keychain_keys.py can't write the
 # FMF/FMIP bplists directly into $KEYS_DIR from inside it — it writes them
@@ -366,6 +369,23 @@ while [ "$ELAPSED" -lt "$BUDGET" ]; do
     done
 
     ELAPSED=$((ELAPSED + 1))
+
+    # Note when each key first lands. This is the only capture-timing signal
+    # that works on both variants: v1 captures inside a C breakpoint condition
+    # and writes silently, so it has no log line to measure against, while v3
+    # logs from Python. The file appearing is common ground.
+    #
+    # v3 evaluates roughly five expressions per capture against v1's single
+    # compiled condition, so it should be 1-3s slower per key. A gap much larger
+    # than that is not expression overhead — it is the 5s evaluation timeout
+    # firing, or relaunch cycles, and those need different fixes.
+    for _K in LocalStorage.key FMFDataManager.bplist FMIPDataManager.bplist; do
+        if [ -f "$KEYS_DIR/$_K" ] && ! echo "${TIMED:-}" | grep -q "$_K"; then
+            TIMED="${TIMED:-} $_K"
+            echo "  ⏱  $_K captured at ${ELAPSED}s" >> "$TIMING_LOG"
+        fi
+    done
+
     got=0
     M_LS="·"; M_FMF="·"; M_FMIP="·"
     if [ -f "$KEYS_DIR/LocalStorage.key" ] || [ -f "$KEYS_DIR/LocalStorage.key.candidate" ]; then
