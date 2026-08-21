@@ -308,6 +308,16 @@ launch_findmy() {
 }
 launch_findmy
 
+# Reads of one keychain item since the last relaunch, i.e. during the current
+# attempt. index() rather than a regex so the bracketed name needs no escaping.
+reads_this_attempt() {
+    awk -v n="$1" '
+        /──── relaunch ────/          { c = 0 }
+        index($0, "SecItemCopyMatching [" n "]") { c++ }
+        END                           { print c + 0 }
+    ' "$LOG2" 2>/dev/null || echo 0
+}
+
 relaunch_findmy() {
     pkill -9 FindMy 2>/dev/null || true
     sleep 0.5
@@ -446,6 +456,34 @@ for _ in $(seq 1 "$WAIT_SECONDS"); do
             [ $((ELAPSED - FIRST_READ_AT)) -ge "$READ_GRACE" ] && RELAUNCH=1
         elif [ $((ELAPSED - ${LAST_LAUNCH_AT:-0})) -ge $((WAIT_SECONDS / 2)) ]; then
             RELAUNCH=1
+        fi
+
+        # Never relaunch a key that Find My *did* ask for. This mechanism exists
+        # for one failure — the read never arriving — and relaunching is a
+        # `pkill -9`. Once the read has landed the capture is either in flight or
+        # has failed, and killing the process helps neither: it lands in the
+        # window between the read and the capture completing, and destroys a
+        # capture that was about to succeed. Measured doing exactly that.
+        #
+        # That window is wider when the handler runs through lldb's command
+        # interpreter than when it is a synchronous breakpoint condition, so the
+        # misfire is not evenly distributed across capture designs — which is
+        # how it corrupted a comparison between two of them.
+        if [ "$RELAUNCH" = "1" ]; then
+            for NAME in FMFDataManager FMIPDataManager; do
+                [ -f "$KEYS_DIR/$NAME.bplist" ] && continue
+                if [ "$(reads_this_attempt "$NAME")" -gt 0 ]; then
+                    RELAUNCH=0
+                    if [ -z "${SAID_INFLIGHT:-}" ]; then
+                        SAID_INFLIGHT=1
+                        [ -t 1 ] && printf '\r\033[2K'
+                        echo "  …  Find My did ask for $NAME — not relaunching. The"
+                        echo "      read arrived, so this is a capture problem rather"
+                        echo "      than a missing request, and killing it now would"
+                        echo "      destroy a capture that may be in flight."
+                    fi
+                fi
+            done
         fi
 
         if [ "$RELAUNCH" = "1" ]; then
