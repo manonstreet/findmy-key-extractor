@@ -394,8 +394,17 @@ def _try_secitem_objc_dump(frame, process, idx):
 
 
 def _save_secitem_result(frame, process, idx, result_ptr):
-    """Identify the SecItemCopyMatching result type and save it."""
+    """Identify the SecItemCopyMatching result type and save it.
+
+    Reports what it saw whenever it fails to produce a key. The two failures
+    that look identical from outside need opposite fixes: a pointer the ObjC
+    runtime cannot name is a stale slot read before the callee's store landed,
+    which is a timing problem; a pointer that names a real class we then fail to
+    extract from is our handling. Without the class name they are the same
+    "yielded no key".
+    """
     global _secitem_captured
+    before = _secitem_captured
 
     opts = lldb.SBExpressionOptions()
     opts.SetTimeoutInMicroSeconds(5_000_000)
@@ -406,25 +415,35 @@ def _save_secitem_result(frame, process, idx, result_ptr):
     r_cls = frame.EvaluateExpression(
         f'(const char *)object_getClassName((id){result_ptr})', opts)
     cls_name = None
-    if not r_cls.GetError().Fail():
+    cls_err = None
+    if r_cls.GetError().Fail():
+        cls_err = r_cls.GetError().GetCString() or "expression failed"
+    else:
         cls_ptr = r_cls.GetValueAsUnsigned()
         if cls_ptr:
             cls_name = _read_cstring(process, cls_ptr, 128)
-    if not cls_name:
-        # Can't identify type — try serializing the whole thing as plist
-        return _serialize_and_save(frame, process, idx, result_ptr, opts)
+        else:
+            cls_err = "object_getClassName returned NULL"
 
-    if "Data" in cls_name:
-        # NSData / NSConcreteMutableData / etc
-        return _save_cfdata(frame, process, idx, result_ptr, opts)
+    if not cls_name:
+        route = "serialize (unidentified)"
+        _serialize_and_save(frame, process, idx, result_ptr, opts)
+    elif "Data" in cls_name:
+        route = f"cfdata ({cls_name})"
+        _save_cfdata(frame, process, idx, result_ptr, opts)
     elif "Dictionary" in cls_name:
-        # NSDictionary — try to extract v_Data (raw keychain value)
-        return _save_dict_result(frame, process, idx, result_ptr, opts)
-    elif "Array" in cls_name:
-        # NSArray — serialize the whole thing
-        return _serialize_and_save(frame, process, idx, result_ptr, opts)
+        route = f"dict ({cls_name})"
+        _save_dict_result(frame, process, idx, result_ptr, opts)
     else:
-        return _serialize_and_save(frame, process, idx, result_ptr, opts)
+        route = f"serialize ({cls_name})"
+        _serialize_and_save(frame, process, idx, result_ptr, opts)
+
+    if _secitem_captured > before:
+        return False
+
+    detail = route if cls_name else f"{route}, {cls_err}"
+    _log(f"     ↳ 0x{result_ptr:x} → {detail}")
+    return False
 
 
 def _read_nsstring(frame, process, ptr, opts):
