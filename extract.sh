@@ -222,10 +222,21 @@ if [ -n "$STALE" ]; then
 fi
 
 # ── Launch both lldb sessions in parallel — they enter --wait-for state ───
+# Several `process continue` commands, not one. lldb runs -o commands in order
+# and `process continue` returns when the process stops, so each queued one
+# absorbs a stop that would otherwise end the session — a simultaneous
+# multi-thread breakpoint hit, or a breakpoint condition that errors. That is
+# the single mechanism behind every capture loss seen so far: batch-mode lldb
+# quits the instant it sees a stop with nothing left to run. Extras are harmless
+# once the target is gone; extract.sh kills these sessions itself regardless.
 sudo lldb --wait-for -n findmylocateagent \
     -o "settings set frame-format ''" \
     -o "settings set auto-confirm true" \
     -o "command script import $SCRIPT_DIR/extract_db_key.py" \
+    -o "process continue" \
+    -o "process continue" \
+    -o "process continue" \
+    -o "process continue" \
     -o "process continue" > "$LOG1" 2>&1 &
 PID1=$!
 
@@ -233,6 +244,10 @@ sudo lldb --wait-for -n FindMy \
     -o "settings set frame-format ''" \
     -o "settings set auto-confirm true" \
     -o "command script import $SCRIPT_DIR/extract_keychain_keys.py" \
+    -o "process continue" \
+    -o "process continue" \
+    -o "process continue" \
+    -o "process continue" \
     -o "process continue" > "$LOG2" 2>&1 &
 PID2=$!
 
@@ -437,13 +452,30 @@ if [ "$FAIL" -ne 0 ]; then
     if [ -n "$FOUND" ]; then
         printf '%s\n' "$FOUND"
     else
-        # No error at all usually means we ran out of time rather than broke:
-        # Find My reads the keychain items at different moments, so a short wait
-        # captures some and misses others.
-        echo "  No errors in the lldb logs — the run most likely ended before"
-        echo "  Find My read every key. Waited ${WAIT_SECONDS}s."
-        echo ""
-        echo "  Try a longer wait:   ./extract.sh --wait 300"
+        # No error in the logs means we did not break — but "ran out of time" is
+        # only one of the two reasons for that, and the logs already say which.
+        # Every intercepted keychain read is logged, so zero reads means Find My
+        # never asked for the key at all. Waiting longer cannot help with that,
+        # and telling someone to raise --wait when their machine did nothing
+        # wrong sends them chasing their own hardware. Measured on an M4 Max:
+        # 6 runs in 14 had Find My skip one or both keychain reads entirely,
+        # interspersed with clean runs, so it is common and it recovers.
+        READS=$(grep -c "SecItemCopyMatching \[" "$LOG2" 2>/dev/null || echo 0)
+        if [ "${READS:-0}" -eq 0 ]; then
+            echo "  Find My did not read its keychain items during this run —"
+            echo "  the lldb session attached and was waiting, but no read ever"
+            echo "  arrived, so there was nothing to capture. This happens on"
+            echo "  repeated back-to-back runs and clears on its own."
+            echo ""
+            echo "  Wait a couple of minutes and run it again. A longer --wait"
+            echo "  will not help: the read is not late, it is absent."
+        else
+            echo "  No errors in the lldb logs, and Find My did read $READS"
+            echo "  keychain item(s) — so the run most likely ended before the"
+            echo "  remaining one arrived. Waited ${WAIT_SECONDS}s."
+            echo ""
+            echo "  Try a longer wait:   ./extract.sh --wait 300"
+        fi
     fi
 fi
 

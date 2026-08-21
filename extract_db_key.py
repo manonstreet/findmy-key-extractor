@@ -133,4 +133,14 @@ def __lldb_init_module(debugger, internal_dict):
 
     _bp = target.BreakpointCreateByName("sqlite3_key_v2")
     _bp.SetScriptCallbackFunction("extract_db_key.on_sqlite3_key_v2")
+    # findmylocateagent opens CloudStorage.db and LocalStorage.db from the same
+    # cooperative thread pool, so on a machine with enough cores both can hit
+    # this breakpoint in the same instant. The per-thread callbacks all return
+    # False, but a simultaneous multi-thread hit still surfaces as a real stop —
+    # and in this --wait-for batch session, a stop with no queued commands left
+    # ends the session outright, losing the key. Observed twice in eleven runs on
+    # an M4 Max, on both lldb 1703 and 2100, always right after CloudStorage.db
+    # is skipped and the process resumes. Auto-continue makes the resume lldb's
+    # responsibility rather than a consequence of what the callbacks returned.
+    _bp.SetAutoContinue(True)
     _log(f"  ⏳  Intercepting sqlite3_key_v2 (resolved {_bp.GetNumLocations()} locations)")
