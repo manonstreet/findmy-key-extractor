@@ -447,35 +447,45 @@ if [ "$FAIL" -ne 0 ]; then
     KEEP_LOGS=1
     # The emoji lines are our own; the real cause is usually a Python traceback
     # or an lldb error, which matches none of them.
+    # What failed, before why it failed. This runs whether or not the logs
+    # hold an error: an error explains a capture that broke, but says nothing
+    # about a key that was never requested, and both can happen in one run. Every
+    # intercepted read is logged, so a key with zero reads was never asked
+    # for by Find My and no wait length can produce it. Report per key: the
+    # usual failure is partial (one key read, the other not), and a blanket
+    # "try a longer wait" sends people to chase hardware that did nothing
+    # wrong. Measured on an M4 Max: 6 runs in 14 skipped one or both reads,
+    # interspersed with clean runs, and it recovers on its own.
+    for NAME in FMFDataManager FMIPDataManager; do
+        [ -f "$KEYS_DIR/$NAME.bplist" ] && continue
+        N=$(grep -c "SecItemCopyMatching \[$NAME\]" "$LOG2" 2>/dev/null || echo 0)
+        if [ "${N:-0}" -eq 0 ]; then
+            echo "  $NAME.bplist — Find My never asked the keychain for this"
+            echo "      key, so there was nothing to intercept. Run the extractor"
+            echo "      again in a minute; this clears on its own."
+        else
+            echo "  $NAME.bplist — Find My read this key $N time(s) but it was"
+            echo "      not captured. See ./logs/lldb_findmy.log"
+        fi
+    done
+
+    if [ ! -f "$KEYS_DIR/LocalStorage.key" ]; then
+        if grep -q "sqlite3_key_v2 hit" "$LOG1" 2>/dev/null; then
+            echo "  LocalStorage.key — findmylocateagent opened a database but the"
+            echo "      session ended before LocalStorage.db was reached."
+            echo "      See ./logs/lldb_locateagent.log"
+        else
+            echo "  LocalStorage.key — findmylocateagent never opened an encrypted"
+            echo "      database during this run. Run the extractor again."
+        fi
+    fi
+
     FOUND=$(grep -hE '⚠️|❌|Traceback|Error|error:|KeyError|Exception|RuntimeError|failed' \
         "$LOG1" "$LOG2" 2>/dev/null | grep -v "^  *$" | tail -30 || true)
     if [ -n "$FOUND" ]; then
+        echo ""
+        echo "  From the lldb logs:"
         printf '%s\n' "$FOUND"
-    else
-        # No error in the logs means we did not break — but "ran out of time" is
-        # only one of the two reasons for that, and the logs already say which.
-        # Every intercepted keychain read is logged, so zero reads means Find My
-        # never asked for the key at all. Waiting longer cannot help with that,
-        # and telling someone to raise --wait when their machine did nothing
-        # wrong sends them chasing their own hardware. Measured on an M4 Max:
-        # 6 runs in 14 had Find My skip one or both keychain reads entirely,
-        # interspersed with clean runs, so it is common and it recovers.
-        READS=$(grep -c "SecItemCopyMatching \[" "$LOG2" 2>/dev/null || echo 0)
-        if [ "${READS:-0}" -eq 0 ]; then
-            echo "  Find My did not read its keychain items during this run —"
-            echo "  the lldb session attached and was waiting, but no read ever"
-            echo "  arrived, so there was nothing to capture. This happens on"
-            echo "  repeated back-to-back runs and clears on its own."
-            echo ""
-            echo "  Wait a couple of minutes and run it again. A longer --wait"
-            echo "  will not help: the read is not late, it is absent."
-        else
-            echo "  No errors in the lldb logs, and Find My did read $READS"
-            echo "  keychain item(s) — so the run most likely ended before the"
-            echo "  remaining one arrived. Waited ${WAIT_SECONDS}s."
-            echo ""
-            echo "  Try a longer wait:   ./extract.sh --wait 300"
-        fi
     fi
 fi
 
