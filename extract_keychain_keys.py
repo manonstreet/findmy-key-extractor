@@ -129,7 +129,7 @@ def _query_service_name(frame, query_ptr):
     if not query_ptr:
         return None
     opts = lldb.SBExpressionOptions()
-    opts.SetTimeoutInMicroSeconds(2_000_000)
+    opts.SetTimeoutInMicroSeconds(1_500_000)
     opts.SetTryAllThreads(False)
     opts.SetLanguage(lldb.eLanguageTypeObjC)
     process = frame.GetThread().GetProcess()
@@ -302,6 +302,13 @@ def _handle_secitem_return(frame):
         _log(f"  ·  return at 0x{pc_stripped:x} with nothing queued")
         return False
 
+    # Announce before doing the work. The relaunch gate in extract.sh holds off
+    # while this log is being written to, and the expression evaluations below
+    # produce no output for seconds — so without this line the gate sees an idle
+    # log, opens, and pkill -9 lands mid-capture. That is 5 of the 6 capture
+    # failures measured on this branch.
+    _log(f"  ⋯  capturing ({len(queue)} pending)")
+
     _secitem_resolved += 1
     process = frame.GetThread().GetProcess()
     captured_any = False
@@ -429,7 +436,7 @@ def _attempt_capture(frame, process, ctx):
 
 def opts_objc(frame):
     o = lldb.SBExpressionOptions()
-    o.SetTimeoutInMicroSeconds(2_000_000)
+    o.SetTimeoutInMicroSeconds(1_500_000)
     o.SetTryAllThreads(False)
     o.SetLanguage(lldb.eLanguageTypeObjC)
     return o
@@ -448,7 +455,7 @@ def _try_secitem_objc_dump(frame, process, idx):
             continue
         # Probe if it looks like a CFData/NSData
         opts = lldb.SBExpressionOptions()
-        opts.SetTimeoutInMicroSeconds(2_000_000)
+        opts.SetTimeoutInMicroSeconds(1_500_000)
         opts.SetTryAllThreads(False)
         r = frame.EvaluateExpression(
             f'(long)CFDataGetLength((void *){candidate})', opts)
@@ -473,7 +480,7 @@ def _save_secitem_result(frame, process, idx, result_ptr):
     before = _secitem_captured
 
     opts = lldb.SBExpressionOptions()
-    opts.SetTimeoutInMicroSeconds(5_000_000)
+    opts.SetTimeoutInMicroSeconds(1_500_000)
     opts.SetTryAllThreads(False)
 
     # Identify the object type via ObjC runtime
@@ -633,7 +640,7 @@ def _save_cfdata(frame, process, idx, data_ptr, opts=None, name=None):
 
     if opts is None:
         opts = lldb.SBExpressionOptions()
-        opts.SetTimeoutInMicroSeconds(5_000_000)
+        opts.SetTimeoutInMicroSeconds(1_500_000)
         opts.SetTryAllThreads(False)
 
     r_len = frame.EvaluateExpression(
