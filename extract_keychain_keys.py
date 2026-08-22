@@ -23,6 +23,9 @@ _secitem_count = 0
 _secitem_captured = 0
 _secitem_resolved = 0
 _pending_returns = {}
+# Return addresses that already carry a breakpoint. Outlives the pending queue,
+# which is deleted when it empties — that deletion is what allowed duplicates.
+_ret_bp_addrs = set()
 _done = False
 
 
@@ -159,8 +162,14 @@ def _on_secitem_entry(frame, bp_loc, extra_args, internal_dict):
         idx = _secitem_count
 
         target = frame.GetThread().GetProcess().GetTarget()
-        # Only set one BP per address — reuse if already pending
-        if lr not in _pending_returns:
+        # One breakpoint per return address, tracked separately from the pending
+        # queue. Keying off _pending_returns alone is not the same thing: the
+        # queue is deleted once it empties, so the next call to the same address
+        # takes this branch again and creates a *second* breakpoint there. They
+        # accumulate, and a caught failure showed two of them interrupting one
+        # expression — "Execution was interrupted, reason: breakpoint 2.1 3.1".
+        if lr not in _ret_bp_addrs:
+            _ret_bp_addrs.add(lr)
             bp_ret = target.BreakpointCreateByAddress(lr)
 
             # Work around an LLDB issue triggered when a Python breakpoint
@@ -177,6 +186,7 @@ def _on_secitem_entry(frame, bp_loc, extra_args, internal_dict):
             bp_ret.SetCommandLineCommands(commands)
             bp_ret.SetAutoContinue(True)
 
+        if lr not in _pending_returns:
             _pending_returns[lr] = []
 
         _pending_returns[lr].append({
