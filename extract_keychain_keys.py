@@ -12,6 +12,7 @@ Usage:
 Keys are written to disk only — never printed to terminal.
 """
 
+import contextlib
 import lldb
 import struct
 from pathlib import Path
@@ -23,14 +24,75 @@ _secitem_count = 0
 _secitem_captured = 0
 _secitem_resolved = 0
 _pending_returns = {}
-# Return addresses that already carry a breakpoint. Outlives the pending queue,
-# which is deleted when it empties — that deletion is what allowed duplicates.
-_ret_bp_addrs = set()
+# Return addresses that already carry a breakpoint, mapped to its breakpoint ID.
+# Outlives the pending queue, which is deleted when it empties — that deletion is
+# what allowed duplicates. The ID is kept so the breakpoint can be deleted and
+# recreated around a capture (see _ret_bp_removed).
+_ret_bp_ids = {}
 _done = False
 
 
 def _log(msg):
     print(msg, flush=True)
+
+
+def _create_ret_bp(target, addr):
+    """Create the return breakpoint at addr, with its command wiring.
+
+    Factored out of the entry handler so that _ret_bp_removed can put an
+    identical breakpoint back after deleting one.
+    """
+    bp_ret = target.BreakpointCreateByAddress(addr)
+
+    # Work around an LLDB issue triggered when a Python breakpoint
+    # callback installs another Python breakpoint callback.
+    #
+    # Instead, attach ordinary LLDB commands to the dynamically
+    # created return breakpoint and invoke the Python handler from
+    # LLDB's command interpreter.
+    commands = lldb.SBStringList()
+    commands.AppendString(
+        "script import lldb, extract_keychain_keys; "
+        "extract_keychain_keys._on_secitem_return_command(lldb.frame)"
+    )
+    bp_ret.SetCommandLineCommands(commands)
+    bp_ret.SetAutoContinue(True)
+    return bp_ret
+
+
+@contextlib.contextmanager
+def _ret_bp_removed(target, *addrs):
+    """Delete the return breakpoint for the duration of a capture, then restore.
+
+    Iteration 1 established that *disabling* a breakpoint does not remove its
+    trap during expression evaluation — with every breakpoint disabled the
+    expression was still interrupted, and the reason string merely lost its
+    location number ("breakpoint 2.." against the baseline's "breakpoint 2.1.").
+    Disabling it made the drop rate twice as bad. Deleting is the one operation
+    that must actually remove the trap.
+
+    Takes several candidate addresses because the pending queue is keyed on
+    either the raw or the PAC-stripped PC and the breakpoint may sit under
+    either.
+    """
+    removed = []
+    for addr in addrs:
+        bp_id = _ret_bp_ids.get(addr)
+        if bp_id is None:
+            continue
+        if target.BreakpointDelete(bp_id):
+            removed.append(addr)
+            del _ret_bp_ids[addr]
+        else:
+            _log(f"  ⚠️  could not delete return breakpoint {bp_id} at 0x{addr:x}")
+    try:
+        yield
+    finally:
+        for addr in removed:
+            try:
+                _ret_bp_ids[addr] = _create_ret_bp(target, addr).GetID()
+            except Exception as e:
+                _log(f"  ⚠️  could not restore return breakpoint at 0x{addr:x}: {e}")
 
 
 def _is_x86(frame):
@@ -168,23 +230,8 @@ def _on_secitem_entry(frame, bp_loc, extra_args, internal_dict):
         # takes this branch again and creates a *second* breakpoint there. They
         # accumulate, and a caught failure showed two of them interrupting one
         # expression — "Execution was interrupted, reason: breakpoint 2.1 3.1".
-        if lr not in _ret_bp_addrs:
-            _ret_bp_addrs.add(lr)
-            bp_ret = target.BreakpointCreateByAddress(lr)
-
-            # Work around an LLDB issue triggered when a Python breakpoint
-            # callback installs another Python breakpoint callback.
-            #
-            # Instead, attach ordinary LLDB commands to the dynamically
-            # created return breakpoint and invoke the Python handler from
-            # LLDB's command interpreter.
-            commands = lldb.SBStringList()
-            commands.AppendString(
-                "script import lldb, extract_keychain_keys; "
-                "extract_keychain_keys._on_secitem_return_command(lldb.frame)"
-            )
-            bp_ret.SetCommandLineCommands(commands)
-            bp_ret.SetAutoContinue(True)
+        if lr not in _ret_bp_ids:
+            _ret_bp_ids[lr] = _create_ret_bp(target, lr).GetID()
 
         if lr not in _pending_returns:
             _pending_returns[lr] = []
@@ -280,7 +327,13 @@ def _handle_secitem_return(frame):
     # fail having said nothing, which is exactly how a 12% second-capture drop
     # stayed invisible on two architectures.
     before = _secitem_captured
-    result = _save_secitem_result(frame, process, idx, data_ptr)
+    # Every expression the capture runs — the class probe, the v_Data lookup,
+    # the CFData reads — executes target code that returns back through this
+    # address. All 24 drops measured in iteration 1 died at the v_Data lookup.
+    # Remove the trap for the whole capture rather than for one call.
+    target = process.GetTarget()
+    with _ret_bp_removed(target, pc, pc_stripped):
+        result = _save_secitem_result(frame, process, idx, data_ptr)
     if _secitem_captured == before:
         _log(f"  ⚠️  [{ctx.get('service')}] dropped — 0x{data_ptr:x} produced no key")
     return result
