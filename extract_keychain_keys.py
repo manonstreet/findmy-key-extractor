@@ -319,13 +319,17 @@ def _save_secitem_result(frame, process, idx, result_ptr):
             cls_name = _read_cstring(process, cls_ptr, 128)
     if not cls_name:
         # Can't identify type — try serializing the whole thing as plist
+        _log(f"     ↳ 0x{result_ptr:x}: class unidentified "
+             f"({r_cls.GetError().GetCString() or 'no name'}) → serialize")
         return _serialize_and_save(frame, process, idx, result_ptr, opts)
 
     if "Data" in cls_name:
         # NSData / NSConcreteMutableData / etc
+        _log(f"     ↳ 0x{result_ptr:x}: {cls_name} → cfdata")
         return _save_cfdata(frame, process, idx, result_ptr, opts)
     elif "Dictionary" in cls_name:
         # NSDictionary — try to extract v_Data (raw keychain value)
+        _log(f"     ↳ 0x{result_ptr:x}: {cls_name} → dict")
         return _save_dict_result(frame, process, idx, result_ptr, opts)
     elif "Array" in cls_name:
         # NSArray — serialize the whole thing
@@ -369,6 +373,11 @@ def _save_dict_result(frame, process, idx, dict_ptr, opts):
     # Try to get the "v_Data" key (kSecValueData) — the raw secret
     r_data = frame.EvaluateExpression(
         f'(id)[(NSDictionary *){dict_ptr} objectForKey:@"v_Data"]', opts)
+    if r_data.GetError().Fail():
+        _log(f"     ↳ dict 0x{dict_ptr:x}: objectForKey v_Data failed "
+             f"({r_data.GetError().GetCString() or 'expression failed'})")
+    elif not _strip_pac(frame, r_data.GetValueAsUnsigned()):
+        _log(f"     ↳ dict 0x{dict_ptr:x}: no v_Data in this dictionary")
     if not r_data.GetError().Fail():
         v_data_ptr = _strip_pac(frame, r_data.GetValueAsUnsigned())
         if v_data_ptr:
