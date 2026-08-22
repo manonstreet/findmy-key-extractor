@@ -250,6 +250,7 @@ def _handle_secitem_return(frame):
     # Return register (x0/rax) holds OSStatus; 0 = success
     status = _retval_signed(frame)
     if status != 0:
+        _log(f"  ⚠️  [{ctx.get('service')}] dropped — OSStatus {status}")
         return False
 
     # Read result pointer from the output parameter (caller's stack location)
@@ -260,9 +261,19 @@ def _handle_secitem_return(frame):
     data_ptr = struct.unpack('<Q', ptr_bytes)[0]
     data_ptr = _strip_pac(frame, data_ptr)
     if not data_ptr:
+        _log(f"  ⚠️  [{ctx.get('service')}] dropped — result slot held null")
         return False
 
-    return _save_secitem_result(frame, process, idx, data_ptr)
+    # Catch-all. _save_secitem_result has around a dozen internal exits and
+    # returns False whether or not it wrote a file, so its return value cannot
+    # report success — measure the counter instead. Without this a capture can
+    # fail having said nothing, which is exactly how a 12% second-capture drop
+    # stayed invisible on two architectures.
+    before = _secitem_captured
+    result = _save_secitem_result(frame, process, idx, data_ptr)
+    if _secitem_captured == before:
+        _log(f"  ⚠️  [{ctx.get('service')}] dropped — 0x{data_ptr:x} produced no key")
+    return result
 
 
 def _try_secitem_objc_dump(frame, process, idx):
@@ -417,10 +428,13 @@ def _save_cfdata(frame, process, idx, data_ptr, opts=None, name=None):
         r_len = frame.EvaluateExpression(
             f'(unsigned long)[(NSData *){data_ptr} length]', opts)
         if r_len.GetError().Fail():
+            _log(f"  ⚠️  cfdata 0x{data_ptr:x}: length unavailable "
+                 f"({r_len.GetError().GetCString() or 'expression failed'})")
             return False
 
     length = r_len.GetValueAsUnsigned()
     if length == 0 or length > 1_000_000:
+        _log(f"  ⚠️  cfdata 0x{data_ptr:x}: length {length} out of range")
         return False
 
     r_bytes = frame.EvaluateExpression(
@@ -430,11 +444,15 @@ def _save_cfdata(frame, process, idx, data_ptr, opts=None, name=None):
         r_bytes = frame.EvaluateExpression(
             f'(void *)[(NSData *){data_ptr} bytes]', opts)
         if r_bytes.GetError().Fail():
+            _log(f"  ⚠️  cfdata 0x{data_ptr:x}: byte pointer unavailable "
+                 f"({r_bytes.GetError().GetCString() or 'expression failed'}), len={length}")
             return False
 
     bytes_ptr = r_bytes.GetValueAsUnsigned()
     data = _read_mem(process, bytes_ptr, length)
     if not data:
+        _log(f"  ⚠️  cfdata 0x{data_ptr:x}: read of {length}B at 0x{bytes_ptr:x} "
+             f"returned nothing")
         return False
 
     filename = f"{name}.bplist" if name else f"secitem_{idx}.bplist"
