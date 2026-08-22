@@ -189,7 +189,19 @@ if pgrep -qx FindMySyncPlus 2>/dev/null; then
 fi
 
 # ── Prime sudo (before banner so password prompt isn't buried) ────────────
-sudo -v
+# Skip it when the commands we actually run are already passwordless. `sudo -v`
+# validates for *every* command, so a scoped NOPASSWD grant does not satisfy it
+# and it prompts on a machine that needs no password for anything this script
+# does — which blocks any unattended run. Probe with one of the granted commands
+# instead. chown on a throwaway file is cheap and has no side effect; `pkill -0
+# launchd` was tried first and returns 1 even without sudo, so it tested nothing.
+_SUDO_PROBE=$(mktemp)
+if sudo -n /usr/sbin/chown "$(whoami)" "$_SUDO_PROBE" >/dev/null 2>&1; then
+    :   # already passwordless for what we run — do not prompt
+else
+    sudo -v
+fi
+rm -f "$_SUDO_PROBE"
 
 echo ""
 echo "  🔑  Find My Key Extractor"
