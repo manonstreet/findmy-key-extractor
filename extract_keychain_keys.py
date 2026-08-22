@@ -12,7 +12,6 @@ Usage:
 Keys are written to disk only — never printed to terminal.
 """
 
-import contextlib
 import lldb
 import struct
 from pathlib import Path
@@ -32,47 +31,6 @@ _done = False
 
 def _log(msg):
     print(msg, flush=True)
-
-
-@contextlib.contextmanager
-def _breakpoints_off(target):
-    """Disable every breakpoint for the duration of an expression evaluation.
-
-    Candidate A of the capture refactor. `objectForKey:` runs target code back
-    through the return address we have a breakpoint on, and lldb aborts the
-    expression — the ~12% drop. Two narrower attempts are already spent and must
-    not be repeated: `SetIgnoreBreakpoints(True)` does not suppress those hits,
-    and disabling only our own return breakpoint made it three times worse. That
-    second experiment ran while duplicate return breakpoints were still
-    accumulating; the dedupe in 32d27a2 fixed that, so disabling one breakpoint
-    and disabling an unbounded growing set are not the same experiment.
-
-    Restores each breakpoint's prior state rather than calling
-    EnableAllBreakpoints, which would also enable any that were off on purpose.
-    """
-    saved = []
-    try:
-        for bp in target.breakpoint_iter():
-            if bp.IsEnabled():
-                saved.append(bp)
-                bp.SetEnabled(False)
-    except Exception as e:
-        _log(f"  ⚠️  could not disable breakpoints for evaluation: {e}")
-    try:
-        yield
-    finally:
-        for bp in saved:
-            try:
-                bp.SetEnabled(True)
-            except Exception as e:
-                _log(f"  ⚠️  could not re-enable breakpoint {bp.GetID()}: {e}")
-
-
-def _eval(frame, expr, opts):
-    """frame.EvaluateExpression with every breakpoint off for the duration."""
-    target = frame.GetThread().GetProcess().GetTarget()
-    with _breakpoints_off(target):
-        return frame.EvaluateExpression(expr, opts)
 
 
 def _is_x86(frame):
@@ -169,7 +127,7 @@ def _query_service_name(frame, query_ptr):
     opts.SetLanguage(lldb.eLanguageTypeObjC)
     process = frame.GetThread().GetProcess()
     query_ptr = _strip_pac(frame, query_ptr)
-    r = _eval(frame,
+    r = frame.EvaluateExpression(
         f'(id)[(NSDictionary *){query_ptr} objectForKey:@"svce"]', opts)
     if r.GetError().Fail():
         return None
@@ -343,7 +301,7 @@ def _try_secitem_objc_dump(frame, process, idx):
         opts = lldb.SBExpressionOptions()
         opts.SetTimeoutInMicroSeconds(2_000_000)
         opts.SetTryAllThreads(False)
-        r = _eval(frame,
+        r = frame.EvaluateExpression(
             f'(long)CFDataGetLength((void *){candidate})', opts)
         if not r.GetError().Fail():
             length = r.GetValueAsUnsigned()
@@ -362,7 +320,7 @@ def _save_secitem_result(frame, process, idx, result_ptr):
 
     # Identify the object type via ObjC runtime
     opts.SetLanguage(lldb.eLanguageTypeObjC)
-    r_cls = _eval(frame,
+    r_cls = frame.EvaluateExpression(
         f'(const char *)object_getClassName((id){result_ptr})', opts)
     cls_name = None
     if not r_cls.GetError().Fail():
@@ -395,7 +353,7 @@ def _read_nsstring(frame, process, ptr, opts):
     ptr = _strip_pac(frame, ptr)
     if not ptr:
         return None
-    r_str = _eval(frame,
+    r_str = frame.EvaluateExpression(
         f'(const char *)[(NSString *){ptr} UTF8String]', opts)
     if not r_str.GetError().Fail():
         str_ptr = r_str.GetValueAsUnsigned()
@@ -412,7 +370,7 @@ def _save_dict_result(frame, process, idx, dict_ptr, opts):
     opts.SetLanguage(lldb.eLanguageTypeObjC)
     service_name = None
     for attr, label in [("svce", "service"), ("acct", "account"), ("labl", "label")]:
-        r_attr = _eval(frame,
+        r_attr = frame.EvaluateExpression(
             f'(id)[(NSDictionary *){dict_ptr} objectForKey:@"{attr}"]', opts)
         if not r_attr.GetError().Fail():
             attr_ptr = _strip_pac(frame, r_attr.GetValueAsUnsigned())
@@ -423,7 +381,7 @@ def _save_dict_result(frame, process, idx, dict_ptr, opts):
                         service_name = attr_val
 
     # Try to get the "v_Data" key (kSecValueData) — the raw secret
-    r_data = _eval(frame,
+    r_data = frame.EvaluateExpression(
         f'(id)[(NSDictionary *){dict_ptr} objectForKey:@"v_Data"]', opts)
     if r_data.GetError().Fail():
         _log(f"     ↳ dict 0x{dict_ptr:x}: objectForKey v_Data failed "
@@ -446,12 +404,12 @@ def _serialize_and_save(frame, process, idx, obj_ptr, opts):
     global _secitem_captured
 
     opts.SetLanguage(lldb.eLanguageTypeObjC)
-    r_ser = _eval(frame,
+    r_ser = frame.EvaluateExpression(
         f'(id)[NSPropertyListSerialization dataWithPropertyList:(id){obj_ptr}'
         f' format:200 options:0 error:nil]', opts)
     if r_ser.GetError().Fail():
         # Last resort: get the ObjC description string
-        r_desc = _eval(frame,
+        r_desc = frame.EvaluateExpression(
             f'(id)[(id){obj_ptr} description]', opts)
         if not r_desc.GetError().Fail():
             desc_ptr = _strip_pac(frame, r_desc.GetValueAsUnsigned())
@@ -482,11 +440,11 @@ def _save_cfdata(frame, process, idx, data_ptr, opts=None, name=None):
         opts.SetTimeoutInMicroSeconds(5_000_000)
         opts.SetTryAllThreads(False)
 
-    r_len = _eval(frame,
+    r_len = frame.EvaluateExpression(
         f'(long)CFDataGetLength((void *){data_ptr})', opts)
     if r_len.GetError().Fail():
         opts.SetLanguage(lldb.eLanguageTypeObjC)
-        r_len = _eval(frame,
+        r_len = frame.EvaluateExpression(
             f'(unsigned long)[(NSData *){data_ptr} length]', opts)
         if r_len.GetError().Fail():
             _log(f"  ⚠️  cfdata 0x{data_ptr:x}: length unavailable "
@@ -498,11 +456,11 @@ def _save_cfdata(frame, process, idx, data_ptr, opts=None, name=None):
         _log(f"  ⚠️  cfdata 0x{data_ptr:x}: length {length} out of range")
         return False
 
-    r_bytes = _eval(frame,
+    r_bytes = frame.EvaluateExpression(
         f'(void *)CFDataGetBytePtr((void *){data_ptr})', opts)
     if r_bytes.GetError().Fail():
         opts.SetLanguage(lldb.eLanguageTypeObjC)
-        r_bytes = _eval(frame,
+        r_bytes = frame.EvaluateExpression(
             f'(void *)[(NSData *){data_ptr} bytes]', opts)
         if r_bytes.GetError().Fail():
             _log(f"  ⚠️  cfdata 0x{data_ptr:x}: byte pointer unavailable "
