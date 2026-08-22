@@ -13,7 +13,6 @@ Keys are written to disk only — never printed to terminal.
 """
 
 import lldb
-import time
 import struct
 from pathlib import Path
 
@@ -24,18 +23,11 @@ _secitem_count = 0
 _secitem_captured = 0
 _secitem_resolved = 0
 _pending_returns = {}
-# Return addresses that already carry a breakpoint. Outlives the pending queue.
-_ret_bp_addrs = set()
 _done = False
 
 
 def _log(msg):
-    # Wall clock on every line. Elapsed-from-run-start cannot separate capture
-    # cost from relaunch cycles: LocalStorage.key is captured by identical code
-    # on both variants and still differed by 2.6s between them, purely because
-    # one branch relaunched more before reaching it. A read-to-capture delta is
-    # the only honest measure, and it needs timestamps on both ends.
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    print(msg, flush=True)
 
 
 def _is_x86(frame):
@@ -127,14 +119,8 @@ def _query_service_name(frame, query_ptr):
     if not query_ptr:
         return None
     opts = lldb.SBExpressionOptions()
-    opts.SetTimeoutInMicroSeconds(1_500_000)
+    opts.SetTimeoutInMicroSeconds(2_000_000)
     opts.SetTryAllThreads(False)
-    # Evaluating an expression runs real code in the target. Our own return
-    # breakpoint sits on a shared return address that ObjC message sends pass
-    # through, so without this the capture interrupts itself:
-    #   Execution was interrupted, reason: breakpoint 2.1
-    # It is not a timeout, so the expression timeout never applied either.
-    opts.SetIgnoreBreakpoints(True)
     opts.SetLanguage(lldb.eLanguageTypeObjC)
     process = frame.GetThread().GetProcess()
     query_ptr = _strip_pac(frame, query_ptr)
@@ -173,13 +159,8 @@ def _on_secitem_entry(frame, bp_loc, extra_args, internal_dict):
         idx = _secitem_count
 
         target = frame.GetThread().GetProcess().GetTarget()
-        # One breakpoint per return address, tracked separately from the pending
-        # queue. Keying off `_pending_returns` alone means that once a queue
-        # empties and is retired, the next call to the same address creates a
-        # *second* breakpoint there — the duplicate-breakpoint bug e39e206 fixed
-        # on the other branch.
-        if lr not in _ret_bp_addrs:
-            _ret_bp_addrs.add(lr)
+        # Only set one BP per address — reuse if already pending
+        if lr not in _pending_returns:
             bp_ret = target.BreakpointCreateByAddress(lr)
 
             # Work around an LLDB issue triggered when a Python breakpoint
@@ -196,20 +177,12 @@ def _on_secitem_entry(frame, bp_loc, extra_args, internal_dict):
             bp_ret.SetCommandLineCommands(commands)
             bp_ret.SetAutoContinue(True)
 
-        if lr not in _pending_returns:
             _pending_returns[lr] = []
-
 
         _pending_returns[lr].append({
             "result_out_ptr": result_out_ptr,
             "index": idx,
             "service": service,
-            # The query dictionary this call passed in. If the pointer we later
-            # read out of the result slot equals this, we are looking at the
-            # query rather than the result — which is the difference between a
-            # timing problem and a matching problem, and nothing else we have
-            # logged can tell those apart.
-            "query_ptr": _strip_pac(frame, query_ptr),
         })
     except Exception as e:
         _log(f"  ⚠️  entry handler exception: {e}")
@@ -254,193 +227,42 @@ def _on_secitem_return(frame, bp_loc, extra_args, internal_dict):
         return False
 
 
-def _secitem_file_exists(service):
-    """Has this service already been captured to disk?
-
-    v1's idempotence trick, ported. It is what makes a duplicate return, a
-    retry, or a relaunch harmless — the capture is attempted at most once per
-    service, and every later return for it is a no-op instead of a second write
-    or a discarded entry.
-    """
-    if not service:
-        return False
-    try:
-        return (OUT_DIR / f"{service}.bplist").exists()
-    except Exception:
-        return False
-
-
 def _handle_secitem_return(frame):
-    """Try every pending call at this return address; keep whatever yields a key.
-
-    There is no reliable way to know *which* queued call a given return belongs
-    to. The return address is shared by every SecItemCopyMatching call from that
-    site. The stack pointer identifies the frame, not the invocation — FMF and
-    FMIP are called from the same function, so their result_out slots are two
-    slots in one frame and their SPs are identical. Matching by SP therefore
-    degenerates to FIFO for exactly the two calls that matter.
-
-    So stop trying to identify the caller and test the evidence instead: attempt
-    each pending entry whose key is not yet on disk, and retire only the ones
-    that actually produce a key. This is safe only because capture is idempotent
-    and non-destructive — a wrong guess costs one failed read of a stack slot,
-    logged, with the entry left in place for the return that does belong to it.
-    """
     global _secitem_captured, _secitem_resolved
 
     pc = frame.GetPC()
     pc_stripped = _strip_pac(frame, pc)
-    addr = pc if pc in _pending_returns else pc_stripped
-    queue = _pending_returns.get(addr)
+    queue = _pending_returns.get(pc) or _pending_returns.get(pc_stripped)
     if not queue:
-        # Benign once both keys are captured and their entries retired.
-        _log(f"  ·  return at 0x{pc_stripped:x} with nothing queued")
         return False
 
-    # Announce before doing the work. The relaunch gate in extract.sh holds off
-    # while this log is being written to, and the expression evaluations below
-    # produce no output for seconds — so without this line the gate sees an idle
-    # log, opens, and pkill -9 lands mid-capture. That is 5 of the 6 capture
-    # failures measured on this branch.
-    _log(f"  ⋯  capturing ({len(queue)} pending)")
-
-    _secitem_resolved += 1
-    process = frame.GetThread().GetProcess()
-    captured_any = False
-
-    tried = []
-    for ctx in list(queue):
-        service = ctx.get("service")
-
-        if _secitem_file_exists(service):
-            _retire_entry(addr, ctx)
-            continue
-
-        try:
-            reason = _attempt_capture(frame, process, ctx)
-        except Exception as e:
-            tried.append(f"{service}: raised {e}")
-            continue
-
-        if reason is None:
-            _retire_entry(addr, ctx)
-            captured_any = True
-        else:
-            tried.append(f"{service}: {reason}")
-
-    # Quiet when something was captured — the ✅ line already says so. Loud only
-    # when a return produced nothing, which is the case that loses keys.
-    if not captured_any and tried:
-        _log("  ⚠️  return captured nothing — " + "; ".join(tried))
-
-    return captured_any
-
-
-def _retire_entry(addr, ctx):
-    """Drop one entry, and the queue with it once empty."""
-    queue = _pending_returns.get(addr)
-    if not queue:
-        return
-    try:
-        queue.remove(ctx)
-    except ValueError:
-        pass
+    ctx = queue.pop(0)  # FIFO — oldest call returns first
+    # Clean up empty queues so the BP can be removed
+    addr = pc if pc in _pending_returns else pc_stripped
     if addr in _pending_returns and not _pending_returns[addr]:
         del _pending_returns[addr]
 
-
-def _attempt_capture(frame, process, ctx):
-    """One capture attempt for one pending call.
-
-    Returns None on success, or a short reason string. The reason is what makes
-    a failed return diagnosable: with several entries tried per return a miss is
-    the normal case, so the caller reports only returns where *nothing* was
-    captured — and then it has to say why each attempt failed, or the failure is
-    exactly as opaque as the silent `return False` this replaced.
-    """
-    global _secitem_captured
-
+    _secitem_resolved += 1
+    process = frame.GetThread().GetProcess()
     idx = ctx["index"]
     result_out_ptr = ctx["result_out_ptr"]
 
+    # Return register (x0/rax) holds OSStatus; 0 = success
     status = _retval_signed(frame)
     if status != 0:
-        return f"OSStatus {status}"
+        return False
 
+    # Read result pointer from the output parameter (caller's stack location)
     ptr_bytes = _read_mem(process, result_out_ptr, 8)
     if not ptr_bytes:
-        before = _secitem_captured
-        _try_secitem_objc_dump(frame, process, idx)
-        return None if _secitem_captured > before else f"slot 0x{result_out_ptr:x} unreadable"
+        return _try_secitem_objc_dump(frame, process, idx)
 
     data_ptr = struct.unpack('<Q', ptr_bytes)[0]
     data_ptr = _strip_pac(frame, data_ptr)
     if not data_ptr:
-        return "slot held null"
+        return False
 
-    before = _secitem_captured
-    _save_secitem_result(frame, process, idx, data_ptr)
-    if _secitem_captured > before:
-        return None
-
-    # Identify what we were handed. Probing individual keys is far more robust
-    # than reading a description string — each is a plain non-null pointer test,
-    # where the previous attempt (allKeys -> description -> UTF8String ->
-    # read_cstring) had four ways to come back empty, and did.
-    if data_ptr == ctx.get("query_ptr"):
-        return f"ptr 0x{data_ptr:x} IS THE QUERY dictionary, not the result"
-
-    # Count errored sends separately from nil returns. Collapsing them is how
-    # "no recognisable keychain keys" ended up meaning either "a real dictionary
-    # with different contents" or "a pointer that cannot be messaged at all" —
-    # which point at opposite fixes.
-    present, nil_keys, errors = [], 0, 0
-    last_err = None
-    for k in ("v_Data", "class", "svce", "acct", "agrp", "labl", "r_Data", "m_Limit"):
-        try:
-            r = frame.EvaluateExpression(
-                f'(id)[(NSDictionary *){data_ptr} objectForKey:@"{k}"]', opts_objc(frame))
-            if r.GetError().Fail():
-                errors += 1
-                last_err = r.GetError().GetCString() or "expression failed"
-            elif r.GetValueAsUnsigned():
-                present.append(k)
-            else:
-                nil_keys += 1
-        except Exception as e:
-            errors += 1
-            last_err = str(e)
-
-    # A count message send is the cheapest liveness test: a real dictionary
-    # answers it, a bad pointer does not.
-    count = None
-    try:
-        rc = frame.EvaluateExpression(
-            f'(long)[(NSDictionary *){data_ptr} count]', opts_objc(frame))
-        if not rc.GetError().Fail():
-            count = rc.GetValueAsSigned()
-    except Exception:
-        pass
-
-    if errors:
-        return (f"ptr 0x{data_ptr:x} NOT MESSAGEABLE — {errors}/8 sends errored "
-                f"(count={count}) last: {last_err}")
-    return (f"ptr 0x{data_ptr:x} is a live dict, count={count}, "
-            f"{nil_keys}/8 known keys nil, present: {', '.join(present) or 'none'}")
-
-
-def opts_objc(frame):
-    o = lldb.SBExpressionOptions()
-    o.SetTimeoutInMicroSeconds(1_500_000)
-    o.SetTryAllThreads(False)
-    # Evaluating an expression runs real code in the target. Our own return
-    # breakpoint sits on a shared return address that ObjC message sends pass
-    # through, so without this the capture interrupts itself:
-    #   Execution was interrupted, reason: breakpoint 2.1
-    # It is not a timeout, so the expression timeout never applied either.
-    o.SetIgnoreBreakpoints(True)
-    o.SetLanguage(lldb.eLanguageTypeObjC)
-    return o
+    return _save_secitem_result(frame, process, idx, data_ptr)
 
 
 def _try_secitem_objc_dump(frame, process, idx):
@@ -456,14 +278,8 @@ def _try_secitem_objc_dump(frame, process, idx):
             continue
         # Probe if it looks like a CFData/NSData
         opts = lldb.SBExpressionOptions()
-        opts.SetTimeoutInMicroSeconds(1_500_000)
+        opts.SetTimeoutInMicroSeconds(2_000_000)
         opts.SetTryAllThreads(False)
-        # Evaluating an expression runs real code in the target. Our own return
-        # breakpoint sits on a shared return address that ObjC message sends pass
-        # through, so without this the capture interrupts itself:
-        #   Execution was interrupted, reason: breakpoint 2.1
-        # It is not a timeout, so the expression timeout never applied either.
-        opts.SetIgnoreBreakpoints(True)
         r = frame.EvaluateExpression(
             f'(long)CFDataGetLength((void *){candidate})', opts)
         if not r.GetError().Fail():
@@ -474,62 +290,37 @@ def _try_secitem_objc_dump(frame, process, idx):
 
 
 def _save_secitem_result(frame, process, idx, result_ptr):
-    """Identify the SecItemCopyMatching result type and save it.
-
-    Reports what it saw whenever it fails to produce a key. The two failures
-    that look identical from outside need opposite fixes: a pointer the ObjC
-    runtime cannot name is a stale slot read before the callee's store landed,
-    which is a timing problem; a pointer that names a real class we then fail to
-    extract from is our handling. Without the class name they are the same
-    "yielded no key".
-    """
+    """Identify the SecItemCopyMatching result type and save it."""
     global _secitem_captured
-    before = _secitem_captured
 
     opts = lldb.SBExpressionOptions()
-    opts.SetTimeoutInMicroSeconds(1_500_000)
+    opts.SetTimeoutInMicroSeconds(5_000_000)
     opts.SetTryAllThreads(False)
-    # Evaluating an expression runs real code in the target. Our own return
-    # breakpoint sits on a shared return address that ObjC message sends pass
-    # through, so without this the capture interrupts itself:
-    #   Execution was interrupted, reason: breakpoint 2.1
-    # It is not a timeout, so the expression timeout never applied either.
-    opts.SetIgnoreBreakpoints(True)
 
     # Identify the object type via ObjC runtime
     opts.SetLanguage(lldb.eLanguageTypeObjC)
     r_cls = frame.EvaluateExpression(
         f'(const char *)object_getClassName((id){result_ptr})', opts)
     cls_name = None
-    cls_err = None
-    if r_cls.GetError().Fail():
-        cls_err = r_cls.GetError().GetCString() or "expression failed"
-    else:
+    if not r_cls.GetError().Fail():
         cls_ptr = r_cls.GetValueAsUnsigned()
         if cls_ptr:
             cls_name = _read_cstring(process, cls_ptr, 128)
-        else:
-            cls_err = "object_getClassName returned NULL"
-
     if not cls_name:
-        route = "serialize (unidentified)"
-        _serialize_and_save(frame, process, idx, result_ptr, opts)
-    elif "Data" in cls_name:
-        route = f"cfdata ({cls_name})"
-        _save_cfdata(frame, process, idx, result_ptr, opts)
+        # Can't identify type — try serializing the whole thing as plist
+        return _serialize_and_save(frame, process, idx, result_ptr, opts)
+
+    if "Data" in cls_name:
+        # NSData / NSConcreteMutableData / etc
+        return _save_cfdata(frame, process, idx, result_ptr, opts)
     elif "Dictionary" in cls_name:
-        route = f"dict ({cls_name})"
-        _save_dict_result(frame, process, idx, result_ptr, opts)
+        # NSDictionary — try to extract v_Data (raw keychain value)
+        return _save_dict_result(frame, process, idx, result_ptr, opts)
+    elif "Array" in cls_name:
+        # NSArray — serialize the whole thing
+        return _serialize_and_save(frame, process, idx, result_ptr, opts)
     else:
-        route = f"serialize ({cls_name})"
-        _serialize_and_save(frame, process, idx, result_ptr, opts)
-
-    if _secitem_captured > before:
-        return False
-
-    detail = route if cls_name else f"{route}, {cls_err}"
-    _log(f"     ↳ 0x{result_ptr:x} → {detail}")
-    return False
+        return _serialize_and_save(frame, process, idx, result_ptr, opts)
 
 
 def _read_nsstring(frame, process, ptr, opts):
@@ -567,37 +358,12 @@ def _save_dict_result(frame, process, idx, dict_ptr, opts):
     # Try to get the "v_Data" key (kSecValueData) — the raw secret
     r_data = frame.EvaluateExpression(
         f'(id)[(NSDictionary *){dict_ptr} objectForKey:@"v_Data"]', opts)
-    if r_data.GetError().Fail():
-        # This is the one exit that explains a barren return logging nothing at
-        # all. object_getClassName is a plain C call needing no runtime lock and
-        # it succeeded; objectForKey: is a message send and it did not. If that
-        # is why, every ObjC send here fails together and the error will say so.
-        _log(f"     ↳ dict 0x{dict_ptr:x}: objectForKey v_Data failed "
-             f"({r_data.GetError().GetCString() or 'expression failed'})")
     if not r_data.GetError().Fail():
         v_data_ptr = _strip_pac(frame, r_data.GetValueAsUnsigned())
         if v_data_ptr:
             # Use service name for filename if available
             name = service_name if service_name else f"secitem_{idx}"
             return _save_cfdata(frame, process, idx, v_data_ptr, opts, name)
-
-    # Name the dictionary's keys before falling back. A keychain *result* holds
-    # v_Data; the *query* passed in to SecItemCopyMatching holds things like
-    # class/svce/r_Data and no value at all. Both are live __NSCFDictionary and
-    # both name cleanly via the ObjC runtime, so the class name cannot tell them
-    # apart — which is why five failures all looked like "a real dictionary we
-    # mishandled" when the question is whether it is the result at all.
-    r_keys = frame.EvaluateExpression(
-        f'(const char *)[[[(NSDictionary *){dict_ptr} allKeys] description] UTF8String]', opts)
-    if not r_keys.GetError().Fail():
-        keys_ptr = r_keys.GetValueAsUnsigned()
-        if keys_ptr:
-            keys = _read_cstring(process, keys_ptr, 512)
-            if keys:
-                _log(f"     ↳ dict keys: {' '.join(keys.split())}")
-    else:
-        _log(f"     ↳ dict 0x{dict_ptr:x}: allKeys failed "
-             f"({r_keys.GetError().GetCString() or 'expression failed'})")
 
     # No v_Data — serialize the whole dictionary as binary plist
     return _serialize_and_save(frame, process, idx, dict_ptr, opts)
@@ -612,14 +378,9 @@ def _serialize_and_save(frame, process, idx, obj_ptr, opts):
         f'(id)[NSPropertyListSerialization dataWithPropertyList:(id){obj_ptr}'
         f' format:200 options:0 error:nil]', opts)
     if r_ser.GetError().Fail():
-        _log(f"     ↳ serialize 0x{obj_ptr:x} failed "
-             f"({r_ser.GetError().GetCString() or 'expression failed'})")
         # Last resort: get the ObjC description string
         r_desc = frame.EvaluateExpression(
             f'(id)[(id){obj_ptr} description]', opts)
-        if r_desc.GetError().Fail():
-            _log(f"     ↳ description 0x{obj_ptr:x} failed too "
-                 f"({r_desc.GetError().GetCString() or 'expression failed'})")
         if not r_desc.GetError().Fail():
             desc_ptr = _strip_pac(frame, r_desc.GetValueAsUnsigned())
             if desc_ptr:
@@ -641,26 +402,13 @@ def _serialize_and_save(frame, process, idx, obj_ptr, opts):
 
 
 def _save_cfdata(frame, process, idx, data_ptr, opts=None, name=None):
-    """Read a CFData/NSData and save to disk.
-
-    Every exit here used to be a bare `return False`, which is how a v_Data
-    pointer that was found and non-null still produced "yielded no key" five
-    times with nothing to say for itself. Four distinct failures live in this
-    function and they need different fixes: an object that is not really a
-    CFData, a zero length, an unreadable byte pointer, and a failed memory read.
-    """
+    """Read a CFData/NSData and save to disk."""
     global _secitem_captured
 
     if opts is None:
         opts = lldb.SBExpressionOptions()
-        opts.SetTimeoutInMicroSeconds(1_500_000)
+        opts.SetTimeoutInMicroSeconds(5_000_000)
         opts.SetTryAllThreads(False)
-        # Evaluating an expression runs real code in the target. Our own return
-        # breakpoint sits on a shared return address that ObjC message sends pass
-        # through, so without this the capture interrupts itself:
-        #   Execution was interrupted, reason: breakpoint 2.1
-        # It is not a timeout, so the expression timeout never applied either.
-        opts.SetIgnoreBreakpoints(True)
 
     r_len = frame.EvaluateExpression(
         f'(long)CFDataGetLength((void *){data_ptr})', opts)
@@ -669,13 +417,10 @@ def _save_cfdata(frame, process, idx, data_ptr, opts=None, name=None):
         r_len = frame.EvaluateExpression(
             f'(unsigned long)[(NSData *){data_ptr} length]', opts)
         if r_len.GetError().Fail():
-            _log(f"     ↳ cfdata 0x{data_ptr:x}: length unavailable "
-                 f"({r_len.GetError().GetCString() or 'expression failed'})")
             return False
 
     length = r_len.GetValueAsUnsigned()
     if length == 0 or length > 1_000_000:
-        _log(f"     ↳ cfdata 0x{data_ptr:x}: length {length} out of range")
         return False
 
     r_bytes = frame.EvaluateExpression(
@@ -685,15 +430,11 @@ def _save_cfdata(frame, process, idx, data_ptr, opts=None, name=None):
         r_bytes = frame.EvaluateExpression(
             f'(void *)[(NSData *){data_ptr} bytes]', opts)
         if r_bytes.GetError().Fail():
-            _log(f"     ↳ cfdata 0x{data_ptr:x}: byte pointer unavailable "
-                 f"({r_bytes.GetError().GetCString() or 'expression failed'}), len={length}")
             return False
 
     bytes_ptr = r_bytes.GetValueAsUnsigned()
     data = _read_mem(process, bytes_ptr, length)
     if not data:
-        _log(f"     ↳ cfdata 0x{data_ptr:x}: read of {length}B at "
-             f"0x{bytes_ptr:x} returned nothing")
         return False
 
     filename = f"{name}.bplist" if name else f"secitem_{idx}.bplist"
