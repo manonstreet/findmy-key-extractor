@@ -13,6 +13,7 @@ Keys are written to disk only — never printed to terminal.
 """
 
 import lldb
+import re
 import struct
 from pathlib import Path
 
@@ -61,11 +62,27 @@ def _watch_result_slot(target, addr):
     out = _run_cmd(target, f"watchpoint set expression -w write -s 8 -- {addr}")
     if out is None:
         return None
-    wp = target.GetLastCreatedWatchpoint()
-    if not wp or not wp.IsValid():
-        _log(f"  ⚠️  watchpoint on 0x{addr:x} reported success but is invalid")
+    # The ID comes out of the command's own text — "Watchpoint created:
+    # Watchpoint 1: addr = 0x…". SBTarget.GetLastCreatedWatchpoint does not
+    # exist on lldb 1700, which is the version on the Intel rig, so the two
+    # SB fallbacks below are only reached if the wording ever changes.
+    wp_id = None
+    m = re.search(r"Watchpoint (\d+):", out)
+    if m:
+        wp_id = int(m.group(1))
+    else:
+        try:
+            n = target.GetNumWatchpoints()
+            if n:
+                wp = target.GetWatchpointAtIndex(n - 1)
+                if wp and wp.IsValid():
+                    wp_id = wp.GetID()
+        except Exception as e:
+            _log(f"  ⚠️  could not enumerate watchpoints: {e}")
+    if wp_id is None:
+        _log(f"  ⚠️  watchpoint on 0x{addr:x} set but its ID could not be read; "
+             f"output was: {out.strip()[:200]}")
         return None
-    wp_id = wp.GetID()
     if _run_cmd(
         target,
         'watchpoint command add '
