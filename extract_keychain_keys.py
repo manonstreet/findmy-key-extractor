@@ -125,13 +125,14 @@ def _on_result_written(frame):
             ctx = _pending_watch.pop(wp_id, None)
             if ctx is not None:
                 _handle_written_result(frame, process, ctx)
-                # Deleting does not take the trap down — measured: `watchpoint
-                # delete` reports success and the watchpoint keeps firing from
+                # Deliberately NOT deleted. `watchpoint delete` reports success
+                # and the trap keeps firing — measured, from
                 # _swift_release_dealloc, nanov2_calloc_type and other code that
-                # reuses this stack slot. Same law as breakpoints. So leave it
-                # armed with this handler attached and make the spurious hits
-                # cheap instead; _wp_spurious counts what that costs.
-                _run_cmd(target, f"watchpoint delete {wp_id}")
+                # reuses this stack slot — but deleting also takes this handler
+                # away with it, so those hits then land on a bare lldb stop and
+                # burn the batch session's queued continues until it quits.
+                # Leaving it armed keeps the handler attached so every spurious
+                # hit is absorbed here and counted.
             else:
                 global _wp_spurious
                 _wp_spurious += 1
