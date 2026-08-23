@@ -23,16 +23,12 @@ _bp_secitem = None
 _secitem_count = 0
 _secitem_captured = 0
 _secitem_resolved = 0
-_pending_returns = {}
 # Candidate C: watchpoint ID -> the call it is watching. The result slot is a
 # stack address in the caller's frame, so it is unique per in-flight call and
 # needs no FIFO queue — which also removes the pop(0) mismatch that made the
 # original drop invisible.
 _pending_watch = {}
 _wp_spurious = 0
-# Return addresses that already carry a breakpoint. Outlives the pending queue,
-# which is deleted when it empties — that deletion is what allowed duplicates.
-_ret_bp_addrs = set()
 _done = False
 
 
@@ -160,7 +156,11 @@ def _handle_written_result(frame, process, ctx):
 
     ptr_bytes = _read_mem(process, ctx["result_out_ptr"], 8)
     if not ptr_bytes:
-        _log(f"  ⚠️  [{ctx.get('service')}] dropped — result slot unreadable")
+        # Same fallback the return-breakpoint path had: hunt the result in the
+        # callee-saved registers. It never fired in any measured failure, but
+        # dropping it would be a quiet loss of robustness, not a simplification.
+        if not _try_secitem_objc_dump(frame, process, ctx["index"]):
+            _log(f"  ⚠️  [{ctx.get('service')}] dropped — result slot unreadable")
         return
     data_ptr = _strip_pac(frame, struct.unpack('<Q', ptr_bytes)[0])
     if not data_ptr:
@@ -187,12 +187,6 @@ def _arg(frame, n):
     names = (["rdi", "rsi", "rdx", "rcx", "r8", "r9"] if _is_x86(frame)
              else ["x0", "x1", "x2", "x3", "x4", "x5"])
     return frame.FindRegister(names[n]).GetValueAsUnsigned()
-
-
-def _retval_signed(frame):
-    """Integer return value, signed (for OSStatus etc)."""
-    name = "rax" if _is_x86(frame) else "x0"
-    return frame.FindRegister(name).GetValueAsSigned()
 
 
 def _entry_return_address(frame):
@@ -330,92 +324,6 @@ def _on_secitem_entry(frame, bp_loc, extra_args, internal_dict):
         _log(f"  ⚠️  entry handler exception: {e}")
 
     return False
-
-
-def _on_secitem_return_command(frame):
-    """Return-breakpoint handler invoked as a regular LLDB command.
-
-    This avoids LLDB's nested Python breakpoint callback issue.
-    """
-    global _secitem_captured
-
-    if _done or not frame or not frame.IsValid():
-        return
-
-    try:
-        _handle_secitem_return(frame)
-
-        if _secitem_captured >= 2:
-            process = frame.GetThread().GetProcess()
-            _finish(process)
-
-    except Exception as e:
-        _log(f"  ⚠️  return command exception: {e}")
-
-
-def _on_secitem_return(frame, bp_loc, extra_args, internal_dict):
-    if _done:
-        return False
-
-    try:
-        result = _handle_secitem_return(frame)
-        # Exit once we've captured both FMF + FMIP (2 items)
-        if _secitem_captured >= 2:
-            process = frame.GetThread().GetProcess()
-            _finish(process)
-        return result
-    except Exception as e:
-        _log(f"  ⚠️  return handler exception: {e}")
-        return False
-
-
-def _handle_secitem_return(frame):
-    global _secitem_captured, _secitem_resolved
-
-    pc = frame.GetPC()
-    pc_stripped = _strip_pac(frame, pc)
-    queue = _pending_returns.get(pc) or _pending_returns.get(pc_stripped)
-    if not queue:
-        return False
-
-    ctx = queue.pop(0)  # FIFO — oldest call returns first
-    # Clean up empty queues so the BP can be removed
-    addr = pc if pc in _pending_returns else pc_stripped
-    if addr in _pending_returns and not _pending_returns[addr]:
-        del _pending_returns[addr]
-
-    _secitem_resolved += 1
-    process = frame.GetThread().GetProcess()
-    idx = ctx["index"]
-    result_out_ptr = ctx["result_out_ptr"]
-
-    # Return register (x0/rax) holds OSStatus; 0 = success
-    status = _retval_signed(frame)
-    if status != 0:
-        _log(f"  ⚠️  [{ctx.get('service')}] dropped — OSStatus {status}")
-        return False
-
-    # Read result pointer from the output parameter (caller's stack location)
-    ptr_bytes = _read_mem(process, result_out_ptr, 8)
-    if not ptr_bytes:
-        return _try_secitem_objc_dump(frame, process, idx)
-
-    data_ptr = struct.unpack('<Q', ptr_bytes)[0]
-    data_ptr = _strip_pac(frame, data_ptr)
-    if not data_ptr:
-        _log(f"  ⚠️  [{ctx.get('service')}] dropped — result slot held null")
-        return False
-
-    # Catch-all. _save_secitem_result has around a dozen internal exits and
-    # returns False whether or not it wrote a file, so its return value cannot
-    # report success — measure the counter instead. Without this a capture can
-    # fail having said nothing, which is exactly how a 12% second-capture drop
-    # stayed invisible on two architectures.
-    before = _secitem_captured
-    result = _save_secitem_result(frame, process, idx, data_ptr)
-    if _secitem_captured == before:
-        _log(f"  ⚠️  [{ctx.get('service')}] dropped — 0x{data_ptr:x} produced no key")
-    return result
 
 
 def _try_secitem_objc_dump(frame, process, idx):
