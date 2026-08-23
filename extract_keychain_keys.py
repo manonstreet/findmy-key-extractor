@@ -175,6 +175,11 @@ def _handle_written_result(frame, process, ctx):
     if _secitem_captured == before:
         _log(f"  ⚠️  [{ctx.get('service')}] dropped — 0x{data_ptr:x} "
              f"produced no key")
+    # Report the spurious-hit cost here rather than only from _finish. _finish
+    # needs two captures in one lldb session, and on a machine where Find My
+    # asks for one key per launch that never happens — which is exactly how this
+    # number went unmeasured on Apple Silicon the first time.
+    _log(f"  ℹ️  {_wp_spurious} spurious watchpoint hits so far")
 
 
 def _is_x86(frame):
