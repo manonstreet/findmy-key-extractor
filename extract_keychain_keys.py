@@ -23,6 +23,11 @@ _secitem_count = 0
 _secitem_captured = 0
 _secitem_resolved = 0
 _pending_returns = {}
+# Candidate C: watchpoint ID -> the call it is watching. The result slot is a
+# stack address in the caller's frame, so it is unique per in-flight call and
+# needs no FIFO queue — which also removes the pop(0) mismatch that made the
+# original drop invisible.
+_pending_watch = {}
 # Return addresses that already carry a breakpoint. Outlives the pending queue,
 # which is deleted when it empties — that deletion is what allowed duplicates.
 _ret_bp_addrs = set()
@@ -31,6 +36,104 @@ _done = False
 
 def _log(msg):
     print(msg, flush=True)
+
+
+def _run_cmd(target, command):
+    """Run one lldb command, returning its output or None."""
+    res = lldb.SBCommandReturnObject()
+    target.GetDebugger().GetCommandInterpreter().HandleCommand(command, res)
+    if not res.Succeeded():
+        _log(f"  ⚠️  lldb command failed: {command} → {res.GetError().strip()}")
+        return None
+    return res.GetOutput() or ""
+
+
+def _watch_result_slot(target, addr):
+    """Set a write watchpoint on the 8-byte result slot; return its ID.
+
+    Driven through the command interpreter rather than SBTarget.WatchAddress:
+    that method's signature changed across the lldb versions this has to run on
+    (1700 on the Intel rig, 1703 and 2100 here), and the interpreter spelling is
+    stable across all three. The command list ends in `continue` for the same
+    reason the return breakpoint used SetAutoContinue — the batch-mode session
+    quits the moment it sees a stop with no queued commands left.
+    """
+    out = _run_cmd(target, f"watchpoint set expression -w write -s 8 -- {addr}")
+    if out is None:
+        return None
+    wp = target.GetLastCreatedWatchpoint()
+    if not wp or not wp.IsValid():
+        _log(f"  ⚠️  watchpoint on 0x{addr:x} reported success but is invalid")
+        return None
+    wp_id = wp.GetID()
+    if _run_cmd(
+        target,
+        'watchpoint command add '
+        '-o "script import lldb, extract_keychain_keys; '
+        'extract_keychain_keys._on_result_written(lldb.frame)" '
+        f'-o "continue" {wp_id}',
+    ) is None:
+        return None
+    return wp_id
+
+
+def _on_result_written(frame):
+    """Watchpoint handler — SecItemCopyMatching has just written its out-param.
+
+    Invoked as an ordinary lldb command, not a Python breakpoint callback, for
+    the same reason the return handler was: nested SetScriptCallbackFunction is
+    broken on lldb 1700.
+    """
+    global _secitem_captured
+
+    if _done or not frame or not frame.IsValid():
+        return
+
+    try:
+        thread = frame.GetThread()
+        if thread.GetStopReason() != lldb.eStopReasonWatchpoint:
+            return
+        wp_id = thread.GetStopReasonDataAtIndex(0)
+        ctx = _pending_watch.pop(wp_id, None)
+        if ctx is None:
+            return
+
+        process = thread.GetProcess()
+        target = process.GetTarget()
+        # Take the watchpoint down before evaluating anything. It has told us
+        # what we needed, and an armed watchpoint on a stack slot is one more
+        # thing that can interrupt an expression.
+        _run_cmd(target, f"watchpoint delete {wp_id}")
+
+        _handle_written_result(frame, process, ctx)
+
+        if _secitem_captured >= 2:
+            _finish(process)
+    except Exception as e:
+        _log(f"  ⚠️  watchpoint handler exception: {e}")
+
+
+def _handle_written_result(frame, process, ctx):
+    """Read the freshly written result pointer and capture it."""
+    global _secitem_captured
+
+    ptr_bytes = _read_mem(process, ctx["result_out_ptr"], 8)
+    if not ptr_bytes:
+        _log(f"  ⚠️  [{ctx.get('service')}] dropped — result slot unreadable")
+        return
+    data_ptr = _strip_pac(frame, struct.unpack('<Q', ptr_bytes)[0])
+    if not data_ptr:
+        # The callee may zero the slot before filling it; that write is not the
+        # one we want and is reported rather than silently ignored.
+        _log(f"  ⚠️  [{ctx.get('service')}] result slot written null — "
+             f"not the result write")
+        return
+
+    before = _secitem_captured
+    _save_secitem_result(frame, process, ctx["index"], data_ptr)
+    if _secitem_captured == before:
+        _log(f"  ⚠️  [{ctx.get('service')}] dropped — 0x{data_ptr:x} "
+             f"produced no key")
 
 
 def _is_x86(frame):
@@ -162,38 +265,24 @@ def _on_secitem_entry(frame, bp_loc, extra_args, internal_dict):
         idx = _secitem_count
 
         target = frame.GetThread().GetProcess().GetTarget()
-        # One breakpoint per return address, tracked separately from the pending
-        # queue. Keying off _pending_returns alone is not the same thing: the
-        # queue is deleted once it empties, so the next call to the same address
-        # takes this branch again and creates a *second* breakpoint there. They
-        # accumulate, and a caught failure showed two of them interrupting one
-        # expression — "Execution was interrupted, reason: breakpoint 2.1 3.1".
-        if lr not in _ret_bp_addrs:
-            _ret_bp_addrs.add(lr)
-            bp_ret = target.BreakpointCreateByAddress(lr)
+        # Candidate C: watch the result slot instead of trapping the return
+        # address. Iterations 1 and 2 established that no breakpoint state —
+        # ignored, disabled, or deleted — stops lldb aborting an expression that
+        # runs target code back through a trapped address. The only way out is
+        # not to have a trap there, so the return breakpoint is gone entirely.
+        # The watchpoint fires where SecItemCopyMatching writes its out-param,
+        # which is inside the callee and nowhere near the shared return address.
+        wp_id = _watch_result_slot(target, result_out_ptr)
+        if wp_id is None:
+            _log(f"  ⚠️  [{service}] could not watch result slot "
+                 f"0x{result_out_ptr:x} — this call is lost")
+            return False
 
-            # Work around an LLDB issue triggered when a Python breakpoint
-            # callback installs another Python breakpoint callback.
-            #
-            # Instead, attach ordinary LLDB commands to the dynamically
-            # created return breakpoint and invoke the Python handler from
-            # LLDB's command interpreter.
-            commands = lldb.SBStringList()
-            commands.AppendString(
-                "script import lldb, extract_keychain_keys; "
-                "extract_keychain_keys._on_secitem_return_command(lldb.frame)"
-            )
-            bp_ret.SetCommandLineCommands(commands)
-            bp_ret.SetAutoContinue(True)
-
-        if lr not in _pending_returns:
-            _pending_returns[lr] = []
-
-        _pending_returns[lr].append({
+        _pending_watch[wp_id] = {
             "result_out_ptr": result_out_ptr,
             "index": idx,
             "service": service,
-        })
+        }
     except Exception as e:
         _log(f"  ⚠️  entry handler exception: {e}")
 
