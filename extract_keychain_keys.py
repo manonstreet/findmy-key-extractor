@@ -29,6 +29,7 @@ _pending_returns = {}
 # needs no FIFO queue — which also removes the pop(0) mismatch that made the
 # original drop invisible.
 _pending_watch = {}
+_wp_spurious = 0
 # Return addresses that already carry a breakpoint. Outlives the pending queue,
 # which is deleted when it empties — that deletion is what allowed duplicates.
 _ret_bp_addrs = set()
@@ -121,15 +122,19 @@ def _on_result_written(frame):
 
         if thread.GetStopReason() == lldb.eStopReasonWatchpoint:
             wp_id = thread.GetStopReasonDataAtIndex(0)
-            # Take the watchpoint down first, whether or not it is one of ours.
-            # An orphan on a reused stack slot fires without end — measured at
-            # 27,567 hits in a single run when the handler was not wired up.
-            _run_cmd(target, f"watchpoint delete {wp_id}")
             ctx = _pending_watch.pop(wp_id, None)
             if ctx is not None:
                 _handle_written_result(frame, process, ctx)
+                # Deleting does not take the trap down — measured: `watchpoint
+                # delete` reports success and the watchpoint keeps firing from
+                # _swift_release_dealloc, nanov2_calloc_type and other code that
+                # reuses this stack slot. Same law as breakpoints. So leave it
+                # armed with this handler attached and make the spurious hits
+                # cheap instead; _wp_spurious counts what that costs.
+                _run_cmd(target, f"watchpoint delete {wp_id}")
             else:
-                _log(f"  ⚠️  watchpoint {wp_id} fired with nothing pending")
+                global _wp_spurious
+                _wp_spurious += 1
         else:
             _log(f"  ⚠️  watchpoint handler reached on stop reason "
                  f"{thread.GetStopReason()} — not a watchpoint")
@@ -249,6 +254,8 @@ def _finish(process):
     if _done:
         return
     _done = True
+    if _wp_spurious:
+        _log(f"  ℹ️  {_wp_spurious} spurious watchpoint hits absorbed")
     _log("")
     process.Kill()
 
