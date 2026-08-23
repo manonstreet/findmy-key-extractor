@@ -120,7 +120,25 @@ def _on_result_written(frame):
             wp_id = thread.GetStopReasonDataAtIndex(0)
             ctx = _pending_watch.pop(wp_id, None)
             if ctx is not None:
-                _handle_written_result(frame, process, ctx)
+                # Disable every watchpoint for the duration of the capture.
+                # On arm64 the injected expression call writes into the watched
+                # stack slot and the watchpoint aborts it — the same failure the
+                # return breakpoint used to cause, one trap over:
+                #   objectForKey v_Data failed (… reason: watchpoint 1.
+                # A lingering watchpoint from an earlier capture does it too, so
+                # disable all rather than just this one.
+                #
+                # Why this is not the disable that failed in iterations 1 and 2:
+                # those were software breakpoints, which lldb implements by
+                # patching an instruction into target memory, and disabling only
+                # changed how the stop was reported. Hardware watchpoints are
+                # debug registers. Disabling one may genuinely clear it.
+                # Untested until now — that is what this measures.
+                _run_cmd(target, "watchpoint disable")
+                try:
+                    _handle_written_result(frame, process, ctx)
+                finally:
+                    _run_cmd(target, "watchpoint enable")
                 # Deliberately NOT deleted. `watchpoint delete` reports success
                 # and the trap keeps firing — measured, from
                 # _swift_release_dealloc, nanov2_calloc_type and other code that
