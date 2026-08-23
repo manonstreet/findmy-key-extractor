@@ -83,12 +83,17 @@ def _watch_result_slot(target, addr):
         _log(f"  ⚠️  watchpoint on 0x{addr:x} set but its ID could not be read; "
              f"output was: {out.strip()[:200]}")
         return None
+    # One -o only. Passing two ("script …" then "continue") registers just the
+    # last of them — measured: lldb reported `Command #1 'continue'` and the
+    # script never ran, so the watchpoint was never deleted and fired 27,567
+    # times on a stack slot that every later call reuses. The handler resumes
+    # the process itself instead; watchpoints have no SetAutoContinue.
     if _run_cmd(
         target,
         'watchpoint command add '
         '-o "script import lldb, extract_keychain_keys; '
         'extract_keychain_keys._on_result_written(lldb.frame)" '
-        f'-o "continue" {wp_id}',
+        f'{wp_id}',
     ) is None:
         return None
     return wp_id
@@ -100,34 +105,47 @@ def _on_result_written(frame):
     Invoked as an ordinary lldb command, not a Python breakpoint callback, for
     the same reason the return handler was: nested SetScriptCallbackFunction is
     broken on lldb 1700.
-    """
-    global _secitem_captured
 
+    Every exit resumes the target. Watchpoints have no SetAutoContinue, and the
+    batch-mode session quits the instant it sees a stop with no queued commands
+    left, so an early return that forgets to continue ends the run.
+    """
     if _done or not frame or not frame.IsValid():
         return
 
+    process = None
     try:
         thread = frame.GetThread()
-        if thread.GetStopReason() != lldb.eStopReasonWatchpoint:
-            return
-        wp_id = thread.GetStopReasonDataAtIndex(0)
-        ctx = _pending_watch.pop(wp_id, None)
-        if ctx is None:
-            return
-
         process = thread.GetProcess()
         target = process.GetTarget()
-        # Take the watchpoint down before evaluating anything. It has told us
-        # what we needed, and an armed watchpoint on a stack slot is one more
-        # thing that can interrupt an expression.
-        _run_cmd(target, f"watchpoint delete {wp_id}")
 
-        _handle_written_result(frame, process, ctx)
-
-        if _secitem_captured >= 2:
-            _finish(process)
+        if thread.GetStopReason() == lldb.eStopReasonWatchpoint:
+            wp_id = thread.GetStopReasonDataAtIndex(0)
+            # Take the watchpoint down first, whether or not it is one of ours.
+            # An orphan on a reused stack slot fires without end — measured at
+            # 27,567 hits in a single run when the handler was not wired up.
+            _run_cmd(target, f"watchpoint delete {wp_id}")
+            ctx = _pending_watch.pop(wp_id, None)
+            if ctx is not None:
+                _handle_written_result(frame, process, ctx)
+            else:
+                _log(f"  ⚠️  watchpoint {wp_id} fired with nothing pending")
+        else:
+            _log(f"  ⚠️  watchpoint handler reached on stop reason "
+                 f"{thread.GetStopReason()} — not a watchpoint")
     except Exception as e:
         _log(f"  ⚠️  watchpoint handler exception: {e}")
+
+    if _secitem_captured >= 2:
+        if process is not None:
+            _finish(process)
+        return
+
+    if not _done and process is not None:
+        try:
+            process.Continue()
+        except Exception as e:
+            _log(f"  ⚠️  could not resume after watchpoint: {e}")
 
 
 def _handle_written_result(frame, process, ctx):
