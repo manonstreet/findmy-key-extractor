@@ -234,6 +234,39 @@ fi
 # when the granted commands actually need it.
 sudo -n /usr/sbin/chown "$(whoami)" "$SCRIPT_DIR" 2>/dev/null || sudo -v
 
+# ── Apple Silicon: is the AMFI boot-arg actually in effect? ───────────────
+# kern.bootargs containing amfi_get_out_of_my_way=1 proves nothing here. Boot
+# args are only honoured under Permissive Security with boot-args filtering
+# disabled; under Reduced Security the argument sits there looking correct while
+# AMFI keeps enforcing. The symptom is lldb attaching and then every memory read
+# failing with "memory read failed for 0x0", which looks like a bug in this
+# script rather than a machine configuration. Needs root, so it runs here rather
+# than in the preflight above.
+if [ "$(uname -m)" = "arm64" ]; then
+    BP=$(sudo bputil -d 2>/dev/null || true)
+    if [ -n "$BP" ]; then
+        BP_MODE=$(printf '%s' "$BP" | sed -n 's/^Security Mode: *\([A-Za-z]*\).*/\1/p')
+        BP_FILT=$(printf '%s' "$BP" | sed -n 's/^Boot Args Filtering Status: *\([A-Za-z]*\).*/\1/p')
+        if [ "$BP_MODE" != "Permissive" ] || [ "$BP_FILT" != "Disabled" ]; then
+            echo ""
+            echo "  ❌  The AMFI boot argument is set but will not take effect."
+            echo ""
+            echo "      Security Mode:              ${BP_MODE:-unknown}   (needs Permissive)"
+            echo "      Boot Args Filtering Status: ${BP_FILT:-unknown}   (needs Disabled)"
+            echo ""
+            echo "      On Apple Silicon, boot arguments are only honoured under"
+            echo "      Permissive Security. Until then amfi_get_out_of_my_way=1"
+            echo "      appears in kern.bootargs while AMFI keeps enforcing, and"
+            echo "      every memory read in the debugger fails."
+            echo ""
+            echo "      Fix: shut down, hold the power button to reach Recovery,"
+            echo "      then 'csrutil disable' and set the boot argument again."
+            echo ""
+            exit 1
+        fi
+    fi
+fi
+
 echo ""
 echo "  ⏳  Waiting for Find My to read its keys (up to ${WAIT_SECONDS}s)..."
 echo ""

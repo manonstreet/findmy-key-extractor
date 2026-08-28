@@ -43,12 +43,51 @@ check both.
 that is SIP fully *enabled*, not "unchanged", and on an OCLP Mac it can break root
 patching, because those patches need `ALLOW_UNAUTHENTICATED_ROOT`.
 
-**A minimum has never been tested.** Every configuration this tool is verified on
-is a full disable. `ALLOW_TASK_FOR_PID` is what lets lldb attach and is certainly
-necessary, and `ALLOW_UNRESTRICTED_NVRAM` is needed before `sudo nvram` will set
-boot arguments — but whether those two alone are *sufficient* is reasoning about
-what the bits mean, not something anyone has run. If you want a config that is
-known to work, disable it fully.
+**The tested minimum is `0x806`.** Measured on an OCLP machine by setting
+`csr-active-config` and running a full extraction at each value:
+
+| value | bits | all three keys? |
+|---|---|---|
+| `0x0fff` | everything | yes |
+| `0x806` | `UNRESTRICTED_FS` + `TASK_FOR_PID` + `UNAUTHENTICATED_ROOT` | **yes** |
+| `0x804` | `TASK_FOR_PID` + `UNAUTHENTICATED_ROOT` | no — Find My is killed at launch |
+
+**`ALLOW_UNRESTRICTED_FS` is required**, which is easy to miss: `ALLOW_TASK_FOR_PID`
+is necessary but *not* sufficient. The tool reads Find My's cache files and its
+container, not just the process.
+
+`ALLOW_UNTRUSTED_KEXTS` is not needed — no kext is involved.
+`ALLOW_UNAUTHENTICATED_ROOT` is in the working value only because OCLP root
+patching needs it; it is probably not needed by this tool, but that was not
+tested. `ALLOW_UNRESTRICTED_NVRAM` is needed before `sudo nvram` will set boot
+arguments, which is a separate step.
+
+Ticking everything is still the simplest thing to do.
+
+### On Apple Silicon, "Customized (sip0): 7f" is a FULL disable
+
+This one causes real confusion. Run `csrutil status` and it says *disabled*; run
+`sudo bputil -d` on the same machine and it says *Customized (sip0): 7f*. Same
+state, different wording. **`0x7f` is what a complete `csrutil disable` produces
+on Apple Silicon** — the platform has no `0xfff`, and "Customized" does not mean
+"incomplete". A machine reading `7f` has SIP fully disabled.
+
+There is also no `csr-active-config` in NVRAM there — SIP lives in the boot
+policy, and only Recovery (hold the power button at startup) can change it.
+
+**What actually matters on Apple Silicon is these two lines from `bputil -d`:**
+
+```text
+Security Mode:               Permissive (smb0 && smb1): 1
+Boot Args Filtering Status:  Disabled   (sip3): 1
+```
+
+Boot arguments are only honoured under **Permissive Security with boot-args
+filtering disabled**. Under Reduced Security, `amfi_get_out_of_my_way=1` sits in
+`kern.bootargs` looking perfectly correct while AMFI keeps enforcing — so the
+usual check passes and extraction still fails, with lldb attaching and then every
+memory read failing (`error: memory read failed for 0x0`). `./diagnose.sh`
+reports all three lines.
 
 ### OCLP's "Disable AMFI" is ticked but AMFI still isn't disabled
 

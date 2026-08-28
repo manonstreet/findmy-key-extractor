@@ -82,9 +82,26 @@ if [ -n "${_csr_raw:-}" ]; then
         say "  note: verified configurations are a full 'csrutil disable'; this is partial"
 elif [ "$(uname -m)" = "arm64" ]; then
     say "  csr-active-config: not in NVRAM (Apple Silicon keeps SIP in the boot policy)"
-    say "  → include 'sudo bputil -d' output; it reports the security mode and the"
-    say "    SIP word, which csrutil does not. Note boot-args are only honoured"
-    say "    under Permissive Security, so AMFI can be set but inert under Reduced."
+    # The boot policy is what decides whether the AMFI boot-arg is honoured, and
+    # only bputil can read it. csrutil reports "disabled" for a config bputil
+    # calls "Customized (sip0): 7f" — same state, different wording, so csrutil
+    # alone cannot answer this.
+    BP=$(sudo bputil -d 2>/dev/null || true)
+    if [ -n "$BP" ]; then
+        BP_MODE=$(printf '%s' "$BP" | sed -n 's/^Security Mode: *\([A-Za-z]*\).*/\1/p')
+        BP_SIP=$(printf '%s' "$BP" | sed -n 's/^SIP Status: *[A-Za-z]* *(sip0): *\(.*\)$/\1/p')
+        BP_FILT=$(printf '%s' "$BP" | sed -n 's/^Boot Args Filtering Status: *\([A-Za-z]*\).*/\1/p')
+        say "  Security Mode:              ${BP_MODE:-?}   (needs Permissive)"
+        say "  SIP word (sip0):            ${BP_SIP:-?}   (7f is a FULL disable here)"
+        say "  Boot Args Filtering Status: ${BP_FILT:-?}   (needs Disabled)"
+        if [ "$BP_MODE" != "Permissive" ] || [ "$BP_FILT" != "Disabled" ]; then
+            BLOCKERS+=("The AMFI boot argument will not take effect. On Apple Silicon boot args are only honoured under Permissive Security with boot-args filtering disabled — until then amfi_get_out_of_my_way=1 appears in kern.bootargs while AMFI keeps enforcing, and every memory read in the debugger fails")
+        fi
+    else
+        say "  boot policy: could not read it — run 'sudo bputil -d' and include"
+        say "               the output. Security Mode and Boot Args Filtering are"
+        say "               what decide whether the AMFI boot-arg is honoured."
+    fi
 fi
 
 # Accept every form in the wild: =1, =0x1, and OCLP's amfi=0x80.
