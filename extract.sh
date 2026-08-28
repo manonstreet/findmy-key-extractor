@@ -224,9 +224,13 @@ if ! sudo -n /usr/sbin/chown "$(whoami)" "$SCRIPT_DIR" 2>/dev/null; then
     echo "  and the password is never stored or sent anywhere."
     echo ""
     echo "  It is used for:"
-    echo "    • lldb          attach to the Find My app to read its keys"
-    echo "    • pkill         restart Find My so it re-reads them"
+    echo "    • lldb          attach to Find My and findmylocateagent"
+    echo "    • pkill, kill   stop those processes and the debugger"
+    echo "    • launchctl     restart the Find My location agent"
     echo "    • chown         make the captured key files readable by you"
+    if [ "$(uname -m)" = "arm64" ]; then
+    echo "    • bputil        read the boot policy, to check AMFI is in effect"
+    fi
     echo ""
 fi
 # `sudo -v` validates the user for *every* command, so a scoped grant does not
