@@ -741,11 +741,25 @@ if [ "$FAIL" -ne 0 ]; then
         fi
     fi
 
+    # This section exists to promote actionable errors. Two things crowd them out:
+    #
+    #   "Process must be launched" — extract.sh queues several `-o process
+    #   continue` commands, so once the target exits or is killed the leftovers
+    #   each report this. It says nothing about why a run failed, and appears in
+    #   successful runs too. The raw log in ./logs/ still has it.
+    #
+    #   Repeats — a single fact restated fifteen times reads as fifteen clues. A
+    #   report was filed whose whole log section was one message repeated.
     FOUND=$(grep -hE '⚠️|❌|Traceback|Error|error:|KeyError|Exception|RuntimeError|failed' \
-        "$LOG1" "$LOG2" 2>/dev/null | grep -v "^  *$" | tail -30 || true)
+        "$LOG1" "$LOG2" 2>/dev/null \
+        | grep -v "Process must be launched" \
+        | sed 's/^[[:space:]]*//' \
+        | grep -v "^$" \
+        | awk '!seen[$0]++' \
+        | tail -30 || true)
     if [ -n "$FOUND" ]; then
         echo ""
-        echo "  From the lldb logs:"
+        echo "  From the lldb logs (repeats collapsed):"
         printf '%s\n' "$FOUND"
     fi
 fi
