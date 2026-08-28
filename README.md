@@ -18,8 +18,21 @@ Used by [FindMySyncPlus](https://github.com/manonstreet/FindMySyncPlus) to decry
 ## Prerequisites
 
 - macOS (Apple Silicon and Intel x86_64)
-  - Verified on macOS 15.7.2 (Intel, lldb-1700) and macOS 26.5.2
-    (Apple Silicon, lldb-1703)
+
+### Tested configurations
+
+| macOS | arch | lldb | result |
+|---|---|---|---|
+| 15.7.2 | Intel (OCLP) | 1700 (Command Line Tools) | all three keys |
+| 26.5.2 | Apple Silicon | 1703 (Xcode) | all three keys |
+| 26.5.2 | Apple Silicon | 2100 (Command Line Tools) | all three keys |
+| 15.7 | Apple Silicon | 1703 | **reported failing** ([#10](https://github.com/manonstreet/findmy-key-extractor/issues/10)) |
+
+**Which lldb runs matters, and it is not always the obvious one.**
+`/usr/bin/lldb` is a shim that forwards to whatever `xcode-select -p` points at,
+so Xcode and the Command Line Tools can supply different builds on the same Mac.
+Every run prints the one it used; `./diagnose.sh` lists all of them and which is
+active. Include that in any bug report.
 - Xcode Command Line Tools — `xcode-select --install` (provides lldb)
 - Python 3 + pip
 - Find My app installed and signed into iCloud

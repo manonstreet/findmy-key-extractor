@@ -114,6 +114,13 @@ fi
 
 hdr "Toolchain"
 say "  lldb:   $(lldb --version 2>/dev/null | head -1 || echo 'not installed')"
+# Which binary that actually is matters: /usr/bin/lldb is a shim that forwards to
+# whatever xcode-select points at, so Xcode and CLT can differ on one machine.
+say "  lldb path:      $(command -v lldb 2>/dev/null || echo 'not on PATH')"
+for _l in /Applications/Xcode.app/Contents/Developer/usr/bin/lldb \
+          /Library/Developer/CommandLineTools/usr/bin/lldb; do
+    [ -x "$_l" ] && say "    $_l — $("$_l" --version 2>/dev/null | head -1)"
+done
 say "  xcode-select: $(xcode-select -p 2>/dev/null)"
 # Prefer the venv beside the script, exactly as extract.sh does — otherwise this
 # reports "deps missing" on a machine where --setup has already succeeded.

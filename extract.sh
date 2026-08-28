@@ -238,6 +238,15 @@ fi
 # when the granted commands actually need it.
 sudo -n /usr/sbin/chown "$(whoami)" "$SCRIPT_DIR" 2>/dev/null || sudo -v
 
+# Which lldb is actually going to run. `sudo lldb` resolves through sudo's
+# secure_path to /usr/bin/lldb, Apple's shim, which forwards to whatever
+# xcode-select points at — so Xcode and Command Line Tools can give different
+# builds on the same machine. A report that does not say which one ran cannot be
+# told apart from one where they are identical.
+echo "  lldb: $(sudo lldb --version 2>/dev/null | head -1 || echo unknown)"
+echo "        developer dir: $(xcode-select -p 2>/dev/null || echo unknown)"
+echo ""
+
 # ── Apple Silicon: is the AMFI boot-arg actually in effect? ───────────────
 # kern.bootargs containing amfi_get_out_of_my_way=1 proves nothing here. Boot
 # args are only honoured under Permissive Security with boot-args filtering
