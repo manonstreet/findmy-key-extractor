@@ -663,7 +663,12 @@ if [ "$FAIL" -ne 0 ]; then
     # interspersed with clean runs, and it recovers on its own.
     for NAME in FMFDataManager FMIPDataManager; do
         [ -f "$KEYS_DIR/$NAME.bplist" ] && continue
-        N=$(grep -c "SecItemCopyMatching \[$NAME\]" "$LOG2" 2>/dev/null || echo 0)
+        # `grep -c` prints 0 AND exits 1 when there are no matches, so a
+        # trailing `|| echo 0` yields "0\n0" and every later test on $N dies
+        # with "integer expression expected" — on the one path a failing user
+        # actually reaches. Take the output and default an empty result instead.
+        N=$(grep -c "SecItemCopyMatching \[$NAME\]" "$LOG2" 2>/dev/null) || true
+        N=${N:-0}
         if [ "${N:-0}" -eq 0 ]; then
             echo "  $NAME.bplist — Find My never asked the keychain for this"
             echo "      key, so there was nothing to intercept. Run the extractor"
