@@ -48,6 +48,45 @@ say "  kern.bootargs: $(sysctl -n kern.bootargs 2>/dev/null || echo '(none)')"
 if csrutil status 2>/dev/null | grep -qiE "Debugging Restrictions: enabled|status: enabled"; then
     BLOCKERS+=("SIP debugging restrictions still enabled — needs a full 'csrutil disable' (README Step 1)")
 fi
+
+# Decode the SIP bitmask and check the one bit this tool actually needs.
+# ALLOW_TASK_FOR_PID (0x4) is the requirement: without it lldb cannot attach and
+# nothing else matters. Intel keeps the value in NVRAM; Apple Silicon keeps it in
+# the boot policy where only bputil (root) can read it.
+_csr_raw=$(nvram csr-active-config 2>/dev/null | awk '{print $2}')
+if [ -n "${_csr_raw:-}" ]; then
+    # nvram prints it byte-swapped as %xx escapes, e.g. %ff%0f -> 0x0fff
+    _hex=$(printf '%s' "$_csr_raw" | tr -d '%' | sed 's/\(..\)\(..\)/\2\1/')
+    _val=$((16#${_hex:-0}))
+    say "  csr-active-config: $_csr_raw  = 0x$(printf '%x' $_val)"
+    # Reported, not asserted. Every configuration this tool has been verified on
+    # was a full `csrutil disable`. Which individual bits are strictly required
+    # has never been tested, so a partial config is reported as untested rather
+    # than declared broken.
+    if [ $(( _val & 4 )) -ne 0 ]; then
+        say "  ALLOW_TASK_FOR_PID: set"
+    else
+        say "  ALLOW_TASK_FOR_PID: not set — lldb attach is expected to fail"
+        BLOCKERS+=("SIP does not allow task_for_pid (0x4), which lldb needs to attach. Note: this tool is only verified against a full 'csrutil disable' — partial configurations are untested either way")
+    fi
+    _flags=""
+    for f in "1:UNTRUSTED_KEXTS" "2:UNRESTRICTED_FS" "4:TASK_FOR_PID" \
+             "8:KERNEL_DEBUGGER" "16:APPLE_INTERNAL" "32:UNRESTRICTED_DTRACE" \
+             "64:UNRESTRICTED_NVRAM" "128:DEVICE_CONFIGURATION" \
+             "256:ANY_RECOVERY_OS" "512:UNAPPROVED_KEXTS" \
+             "1024:EXECUTABLE_POLICY_OVERRIDE" "2048:UNAUTHENTICATED_ROOT"; do
+        [ $(( _val & ${f%%:*} )) -ne 0 ] && _flags="$_flags ${f##*:}"
+    done
+    say "  allowed:${_flags:- none}"
+    csrutil status 2>/dev/null | grep -qi "status: disabled" || \
+        say "  note: verified configurations are a full 'csrutil disable'; this is partial"
+elif [ "$(uname -m)" = "arm64" ]; then
+    say "  csr-active-config: not in NVRAM (Apple Silicon keeps SIP in the boot policy)"
+    say "  → include 'sudo bputil -d' output; it reports the security mode and the"
+    say "    SIP word, which csrutil does not. Note boot-args are only honoured"
+    say "    under Permissive Security, so AMFI can be set but inert under Reduced."
+fi
+
 # Accept every form in the wild: =1, =0x1, and OCLP's amfi=0x80.
 if sysctl -n kern.bootargs 2>/dev/null | grep -qE "amfi_get_out_of_my_way=(1|0x1)|amfi=0x80"; then
     say "  AMFI: disabled ✅"

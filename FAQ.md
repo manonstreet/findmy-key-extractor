@@ -12,7 +12,7 @@ is safe to paste into an issue.
 
 Yes. The keys live in memory in Apple's own processes, and the only way to read
 them is to attach a debugger — which SIP exists to prevent. Specifically you need
-`ALLOW_TASK_FOR_PID`; without it `lldb` cannot attach and nothing else matters.
+`ALLOW_TASK_FOR_PID`; without it `lldb` cannot attach and nothing else matters. (A full `csrutil disable` is the only configuration this tool is verified against.)
 
 ### `csrutil disable` says it worked, but `csrutil status` still shows restrictions
 
@@ -43,9 +43,12 @@ check both.
 that is SIP fully *enabled*, not "unchanged", and on an OCLP Mac it can break root
 patching, because those patches need `ALLOW_UNAUTHENTICATED_ROOT`.
 
-If you prefer the minimum: whatever your machine is booted with now, plus
-`ALLOW_TASK_FOR_PID`. `ALLOW_UNRESTRICTED_NVRAM` is worth adding too — without it
-`sudo nvram` refuses to set boot arguments.
+**A minimum has never been tested.** Every configuration this tool is verified on
+is a full disable. `ALLOW_TASK_FOR_PID` is what lets lldb attach and is certainly
+necessary, and `ALLOW_UNRESTRICTED_NVRAM` is needed before `sudo nvram` will set
+boot arguments — but whether those two alone are *sufficient* is reasoning about
+what the bits mean, not something anyone has run. If you want a config that is
+known to work, disable it fully.
 
 ### OCLP's "Disable AMFI" is ticked but AMFI still isn't disabled
 
