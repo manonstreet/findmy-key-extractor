@@ -216,7 +216,9 @@ echo ""
 echo "  🔑  Find My Key Extractor"
 echo "  ─────────────────────────"
 echo ""
-if ! sudo -n true 2>/dev/null; then
+# Probe with a command that is actually in a scoped NOPASSWD grant. `true` is
+# not, so a machine set up for unattended runs was told it needed a password.
+if ! sudo -n /usr/sbin/chown "$(whoami)" "$SCRIPT_DIR" 2>/dev/null; then
     echo "  Administrator access is required. macOS will prompt for your login"
     echo "  password next — that prompt comes from macOS, not from this script,"
     echo "  and the password is never stored or sent anywhere."
@@ -227,7 +229,10 @@ if ! sudo -n true 2>/dev/null; then
     echo "    • chown         make the captured key files readable by you"
     echo ""
 fi
-sudo -v
+# `sudo -v` validates the user for *every* command, so a scoped grant does not
+# satisfy it — it prompts, and with no TTY the run dies in a second. Prime only
+# when the granted commands actually need it.
+sudo -n /usr/sbin/chown "$(whoami)" "$SCRIPT_DIR" 2>/dev/null || sudo -v
 
 echo ""
 echo "  ⏳  Waiting for Find My to read its keys (up to ${WAIT_SECONDS}s)..."
