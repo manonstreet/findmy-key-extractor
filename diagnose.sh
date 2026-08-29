@@ -135,6 +135,48 @@ for _l in /Applications/Xcode.app/Contents/Developer/usr/bin/lldb \
           /Library/Developer/CommandLineTools/usr/bin/lldb; do
     [ -x "$_l" ] && say "    $_l — $("$_l" --version 2>/dev/null | head -1)"
 done
+
+# If the last run's lldb sessions never resolved their breakpoints, this lldb
+# probably cannot attach on this machine — a different one may. Read from the
+# logs extract.sh leaves behind on failure, rather than doing this inside
+# extract.sh: that script runs set -euo pipefail in the path that reports
+# failures and has already shipped two crashes there. Nothing here can cost
+# anyone a capture.
+_alt=""
+for _l in /Applications/Xcode.app/Contents/Developer/usr/bin/lldb \
+          /Library/Developer/CommandLineTools/usr/bin/lldb; do
+    [ -x "$_l" ] || continue
+    # skip whichever one the shim already resolves to
+    [ "$("$_l" --version 2>/dev/null | head -1)" = "$(lldb --version 2>/dev/null | head -1)" ] && continue
+    _alt="$_l"
+done
+# $0 can be unreliable when this is piped, same caveat as HERE further down,
+# so fall back to the working directory.
+_here="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo "$PWD")"
+_stuck=""
+for _log in "$_here/logs/lldb_findmy.log" "$_here/logs/lldb_locateagent.log" \
+            "$PWD/logs/lldb_findmy.log" "$PWD/logs/lldb_locateagent.log"; do
+    [ -f "$_log" ] || continue
+    grep -qE "SecItemCopyMatching: 0 locs|resolved 0 locations" "$_log" 2>/dev/null || continue
+    grep -q "location added to breakpoint" "$_log" 2>/dev/null && continue
+    _stuck="yes"
+done
+if [ -n "$_stuck" ] && [ -n "$_alt" ]; then
+    _cur="$(xcode-select -p 2>/dev/null || echo /Library/Developer/CommandLineTools)"
+    _altdir="${_alt%/usr/bin/lldb}"
+    say ""
+    say "  ⚠️  the last run's lldb session never resolved its breakpoints."
+    say "      That usually means this lldb cannot attach on this machine."
+    say ""
+    say "      Another lldb is installed:"
+    say "        $_alt ($("$_alt" --version 2>/dev/null | head -1))"
+    say ""
+    say "      Switch to it and run ./extract.sh again:"
+    say "        sudo xcode-select -s $_altdir"
+    say ""
+    say "      To revert:"
+    say "        sudo xcode-select -s $_cur"
+fi
 say "  xcode-select: $(xcode-select -p 2>/dev/null)"
 # Prefer the venv beside the script, exactly as extract.sh does — otherwise this
 # reports "deps missing" on a machine where --setup has already succeeded.
