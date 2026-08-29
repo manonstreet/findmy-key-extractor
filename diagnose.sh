@@ -55,9 +55,23 @@ fi
 # the boot policy where only bputil (root) can read it.
 _csr_raw=$(nvram csr-active-config 2>/dev/null | awk '{print $2}')
 if [ -n "${_csr_raw:-}" ]; then
-    # nvram prints it byte-swapped as %xx escapes, e.g. %ff%0f -> 0x0fff
-    _hex=$(printf '%s' "$_csr_raw" | tr -d '%' | sed 's/\(..\)\(..\)/\2\1/')
-    _val=$((16#${_hex:-0}))
+    # nvram only escapes non-printable bytes. A printable byte prints as itself,
+    # so 0x0f67 comes out as "g%0f" (0x67 is "g") and 0x083f as "?%08". Stripping
+    # the % signs and reading the rest as hex therefore fails on any value with a
+    # printable byte in it. Decode byte by byte instead, little-endian.
+    _val=$(printf '%s' "$_csr_raw" | python3 -c '
+import sys
+raw = sys.stdin.read().strip()
+out = bytearray()
+i = 0
+while i < len(raw):
+    if raw[i] == "%" and i + 2 < len(raw) + 1:
+        out.append(int(raw[i+1:i+3], 16)); i += 3
+    else:
+        out.append(ord(raw[i])); i += 1
+print(int.from_bytes(bytes(out), "little"))
+' 2>/dev/null || true)
+    [ -n "${_val:-}" ] || _val=0
     say "  csr-active-config: $_csr_raw  = 0x$(printf '%x' $_val)"
     # Reported, not asserted. Every configuration this tool has been verified on
     # was a full `csrutil disable`. Which individual bits are strictly required
