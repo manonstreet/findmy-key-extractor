@@ -73,15 +73,18 @@ print(int.from_bytes(bytes(out), "little"))
 ' 2>/dev/null || true)
     [ -n "${_val:-}" ] || _val=0
     say "  csr-active-config: $_csr_raw  = 0x$(printf '%x' $_val)"
-    # Reported, not asserted. Every configuration this tool has been verified on
-    # was a full `csrutil disable`. Which individual bits are strictly required
-    # has never been tested, so a partial config is reported as untested rather
-    # than declared broken.
-    if [ $(( _val & 4 )) -ne 0 ]; then
-        say "  ALLOW_TASK_FOR_PID: set"
+    # Which bits are required was measured 2026-08-27 by setting csr-active-config
+    # and running a full extraction at each value: 0x804 fails (Find My is killed
+    # at launch), 0x806 captures all three keys. So UNRESTRICTED_FS (0x2) and
+    # TASK_FOR_PID (0x4) are both required — task_for_pid alone is not enough.
+    _missing=""
+    [ $(( _val & 2 )) -ne 0 ] || _missing="$_missing UNRESTRICTED_FS(0x2)"
+    [ $(( _val & 4 )) -ne 0 ] || _missing="$_missing TASK_FOR_PID(0x4)"
+    if [ -z "$_missing" ]; then
+        say "  required bits: UNRESTRICTED_FS + TASK_FOR_PID both set ✅"
     else
-        say "  ALLOW_TASK_FOR_PID: not set — lldb attach is expected to fail"
-        BLOCKERS+=("SIP does not allow task_for_pid (0x4), which lldb needs to attach. Note: this tool is only verified against a full 'csrutil disable' — partial configurations are untested either way")
+        say "  required bits MISSING:$_missing ❌"
+        BLOCKERS+=("SIP is missing$_missing. Measured: 0x804 fails and 0x806 works, so both UNRESTRICTED_FS and TASK_FOR_PID are needed — task_for_pid alone is not sufficient. A full 'csrutil disable' covers it")
     fi
     _flags=""
     for f in "1:UNTRUSTED_KEXTS" "2:UNRESTRICTED_FS" "4:TASK_FOR_PID" \
@@ -92,8 +95,6 @@ print(int.from_bytes(bytes(out), "little"))
         [ $(( _val & ${f%%:*} )) -ne 0 ] && _flags="$_flags ${f##*:}"
     done
     say "  allowed:${_flags:- none}"
-    csrutil status 2>/dev/null | grep -qi "status: disabled" || \
-        say "  note: verified configurations are a full 'csrutil disable'; this is partial"
 elif [ "$(uname -m)" = "arm64" ]; then
     say "  csr-active-config: not in NVRAM (Apple Silicon keeps SIP in the boot policy)"
     # The boot policy is what decides whether the AMFI boot-arg is honoured, and

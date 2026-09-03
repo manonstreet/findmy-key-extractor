@@ -226,10 +226,16 @@ and reported independently from a Proxmox VM.
 
 ### `pip install` tries to compile `cryptography` and fails
 
-`cryptography` needs a Rust toolchain to build from source, which most machines
-don't have. Use `./extract.sh --setup`, which installs prebuilt wheels only and
-fails immediately with a clear message if none exist for your Python. Python 3.11
-or newer has the widest wheel coverage.
+`cryptography` needs a Rust toolchain and OpenSSL headers to build from source,
+which most machines don't have. Use `./extract.sh --setup`, which installs
+prebuilt wheels only and fails immediately if none exist for your Python.
+
+Wheels are published per Python version, so a release that has only just come out
+may not have one yet and pip falls back to a source build. Switching to a Python
+that has been out longer is worth trying — it is more likely to have a wheel.
+
+**If it does build from source, it needs OpenSSL** — `brew install openssl@3` is
+usually the missing piece.
 
 ### Are the keys the same on my other Mac?
 
